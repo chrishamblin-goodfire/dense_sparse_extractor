@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
+import matplotlib.pyplot as plt
 
 from dense_sparse_extractor.data import (
     CombinedDataset,
@@ -12,11 +13,6 @@ from dense_sparse_extractor.data import (
     denormalize_mnist,
     make_mnist_datasets,
 )
-
-try:
-    import matplotlib.pyplot as plt
-except Exception as e:  # pragma: no cover
-    raise RuntimeError("matplotlib is required for this visualization script.") from e
 
 
 #%% Helpers
