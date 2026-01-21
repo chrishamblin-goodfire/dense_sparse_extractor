@@ -22,4 +22,5 @@ dist/
 checkpoints/
 wandb/
 data/
+logs/
 
