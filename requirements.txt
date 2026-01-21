@@ -4,3 +4,4 @@ PyYAML
 tqdm
 matplotlib
 ipykernel
+wandb

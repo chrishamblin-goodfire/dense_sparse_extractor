@@ -14,3 +14,10 @@ momentum: 0.9 # only used for sgd
 
 n_epochs: 5
 log_every_steps: 100
+
+# Optional Weights & Biases logging
+# If enabled, you must set at least `wandb.project`.
+wandb:
+  enabled: false
+  project: "dense-sparse-extractor_base_model"
+  name: "mlp-baseline"

@@ -39,6 +39,17 @@ class TrainingConfig:
     log_every_steps: int = 100
 
 
+@dataclass(frozen=True)
+class WandbConfig:
+    enabled: bool = False
+    project: str | None = None
+    name: str | None = None
+    entity: str | None = None
+    tags: list[str] | None = None
+    notes: str | None = None
+    mode: str | None = None  # e.g. "online" | "offline" | "disabled"
+
+
 def _load_yaml(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
@@ -183,6 +194,7 @@ def main() -> None:
     model_cfg = _load_yaml(Path(args.model_config))
     train_cfg_dict = _load_yaml(Path(args.train_config))
     train_cfg = _dataclass_from_dict(TrainingConfig, train_cfg_dict)
+    wandb_cfg = _dataclass_from_dict(WandbConfig, train_cfg_dict.get("wandb", {}) or {})
 
     torch.manual_seed(int(train_cfg.seed))
 
@@ -204,6 +216,32 @@ def main() -> None:
     model = _build_model(model_cfg).to(device)
     optimizer = _make_optimizer(model, train_cfg)
 
+    wandb_run = None
+    if bool(wandb_cfg.enabled):
+        if not wandb_cfg.project:
+            raise ValueError("wandb.enabled is true but wandb.project is missing in the train config YAML.")
+        try:
+            import wandb  # type: ignore
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError(
+                "W&B logging is enabled in the config, but wandb is not installed. "
+                "Install it with `pip install wandb` (or add it to requirements)."
+            ) from e
+
+        wandb_run = wandb.init(
+            project=str(wandb_cfg.project),
+            name=(str(wandb_cfg.name) if wandb_cfg.name else None),
+            entity=(str(wandb_cfg.entity) if wandb_cfg.entity else None),
+            tags=(list(wandb_cfg.tags) if wandb_cfg.tags else None),
+            notes=(str(wandb_cfg.notes) if wandb_cfg.notes else None),
+            mode=(str(wandb_cfg.mode) if wandb_cfg.mode else None),
+            config={
+                "training": train_cfg_dict,
+                "model": model_cfg,
+            },
+        )
+        wandb_run.log({"device": str(device)})
+
     for epoch in range(1, int(train_cfg.n_epochs) + 1):
         train_metrics = train_one_epoch(
             model=model,
@@ -218,6 +256,21 @@ def main() -> None:
             f"train loss {train_metrics['loss']:.4f} acc {train_metrics['acc']:.4f} | "
             f"test loss {test_metrics['loss']:.4f} acc {test_metrics['acc']:.4f}"
         )
+
+        if wandb_run is not None:
+            wandb_run.log(
+                {
+                    "epoch": epoch,
+                    "train/loss": float(train_metrics["loss"]),
+                    "train/acc": float(train_metrics["acc"]),
+                    "test/loss": float(test_metrics["loss"]),
+                    "test/acc": float(test_metrics["acc"]),
+                },
+                step=epoch,
+            )
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

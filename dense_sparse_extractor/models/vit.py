@@ -12,7 +12,7 @@ class ViTConfig:
     """Hyperparameters for a small ViT classifier for MNIST."""
 
     image_size: int = 28
-    patch_size: int = 7
+    patch_size: int = 4
     in_channels: int = 1
     num_classes: int = 10
 

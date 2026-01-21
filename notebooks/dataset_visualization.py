@@ -79,3 +79,5 @@ axs[2].axis("off")
 plt.tight_layout()
 plt.show()
 
+
+# %%
