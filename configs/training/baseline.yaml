@@ -1,0 +1,16 @@
+seed: 42
+
+device: auto # "auto" | "cpu" | "cuda"
+
+data_dir: ./data
+batch_size: 128
+num_workers: 2
+pin_memory: true
+
+optimizer: adamw # "adamw" | "adam" | "sgd"
+lr: 0.001
+weight_decay: 0.01
+momentum: 0.9 # only used for sgd
+
+n_epochs: 5
+log_every_steps: 100

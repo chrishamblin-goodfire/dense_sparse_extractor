@@ -1,0 +1,9 @@
+model_type: mlp
+
+# MNIST: 1x28x28 -> 10 classes
+in_dim: 784
+num_classes: 10
+
+hidden_sizes: [256, 256]
+dropout: 0.1
+activation: gelu
