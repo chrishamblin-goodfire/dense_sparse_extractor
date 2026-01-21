@@ -31,7 +31,8 @@ def to_display_image(x: torch.Tensor) -> torch.Tensor:
 
 
 #%% Config
-repo_root = Path(__file__).resolve().parents[2]
+# notebook file is at: repo_root/notebooks/dataset_visualization.py
+repo_root = Path(__file__).resolve().parents[1]
 data_dir = repo_root / "data"
 
 noise_cfg = NoiseTagConfig(

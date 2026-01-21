@@ -1,7 +1,7 @@
 """Model zoo for MNIST experiments."""
 
-from .mlp import MLPConfig, MNISTMLP
 from .convnet import ConvNetConfig, MNISTConvNet
+from .mlp import MLPConfig, MNISTMLP
 from .vit import ViTConfig, MNISTViT
 
 __all__ = [
