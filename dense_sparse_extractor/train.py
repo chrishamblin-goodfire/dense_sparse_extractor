@@ -4,6 +4,10 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Literal
 
+import json
+import shutil
+import sys
+import time
 import torch
 import torch.nn as nn
 from jsonargparse import ActionConfigFile, ArgumentParser, namespace_to_dict
@@ -14,7 +18,7 @@ from .data import NoiseTagConfig, make_combined_loaders, make_mnist_loaders, mak
 from .models.convnet import ConvNetConfig, MNISTConvNet
 from .models.mlp import MLPConfig, MNISTMLP
 from .models.vit import ViTConfig, MNISTViT
-from .utils import checkpoint_dir, pick_unique_run_name, save_checkpoint
+from .utils import checkpoint_dir, pick_unique_run_name, save_checkpoint, write_yaml
 
 
 ModelType = Literal["mlp", "convnet", "vit"]
@@ -262,14 +266,25 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     log_every_steps: int,
-) -> dict[str, float]:
+    *,
+    wandb_run: Any | None = None,
+    epoch: int | None = None,
+    global_step: int = 0,
+) -> tuple[dict[str, float], dict[str, float], int]:
     model.train()
     total_loss = 0.0
     total_acc = 0.0
     total = 0
 
+    epoch_t0 = time.perf_counter()
+    batch_times_sec: list[float] = []
+    interval_sum_sec = 0.0
+    interval_count = 0
+
     pbar = tqdm(loader, desc="train", leave=False)
     for step, (x, y) in enumerate(pbar, start=1):
+        batch_t0 = time.perf_counter()
+
         x = x.to(device)
         y = y.to(device)
 
@@ -292,13 +307,44 @@ def train_one_epoch(
         total_acc += float(acc) * bs
         total += bs
 
+        batch_t1 = time.perf_counter()
+        batch_time_sec = float(batch_t1 - batch_t0)
+        batch_times_sec.append(batch_time_sec)
+        interval_sum_sec += batch_time_sec
+        interval_count += 1
+
+        global_step += 1
+        if wandb_run is not None and log_every_steps and step % int(log_every_steps) == 0:
+            # Respect the same cadence as console logging.
+            # We log the mean batch time over the last interval for stability.
+            wandb_run.log(
+                {
+                    "epoch": int(epoch) if epoch is not None else 0,
+                    "global_step": int(global_step),
+                    "time/batch_sec": float(interval_sum_sec / max(1, interval_count)),
+                },
+                step=int(global_step),
+            )
+            interval_sum_sec = 0.0
+            interval_count = 0
+
         if log_every_steps and step % int(log_every_steps) == 0:
             pbar.set_postfix(loss=total_loss / max(1, total), acc=total_acc / max(1, total))
 
-    return {
+    epoch_t1 = time.perf_counter()
+    epoch_time_sec = float(epoch_t1 - epoch_t0)
+    avg_batch_time_sec = float(sum(batch_times_sec) / max(1, len(batch_times_sec)))
+
+    metrics = {
         "loss": total_loss / max(1, total),
         "acc": total_acc / max(1, total),
     }
+    timing = {
+        "time/epoch_sec": epoch_time_sec,
+        "time/avg_batch_sec": avg_batch_time_sec,
+    }
+
+    return metrics, timing, global_step
 
 
 def _make_optimizer(model: nn.Module, cfg: TrainingConfig) -> torch.optim.Optimizer:
@@ -317,6 +363,58 @@ def _make_optimizer(model: nn.Module, cfg: TrainingConfig) -> torch.optim.Optimi
             weight_decay=float(cfg.weight_decay),
         )
     raise ValueError(f"Unknown optimizer: {cfg.optimizer}")
+
+
+def _save_config_snapshot(
+    *,
+    ckpt_dir: Path,
+    train_cfg_dict: dict[str, Any],
+    model_cfg: dict[str, Any],
+    full_cfg_dict: dict[str, Any],
+    config_files: list[str],
+    argv: list[str],
+) -> Path:
+    """
+    Save an exact, reproducible snapshot of the run configuration.
+
+    Includes:
+    - resolved training/model YAML (after all config merging + CLI overrides)
+    - full resolved YAML (union)
+    - the raw source YAML files (defaults + any --config files)
+    - the exact argv used to launch the run
+    """
+    snap_dir = ckpt_dir / "config_snapshot"
+    sources_dir = snap_dir / "sources"
+    sources_dir.mkdir(parents=True, exist_ok=True)
+
+    (snap_dir / "argv.txt").write_text(" ".join([sys.executable, *argv]) + "\n", encoding="utf-8")
+    (snap_dir / "config_files.txt").write_text("\n".join(config_files) + "\n", encoding="utf-8")
+
+    write_yaml(snap_dir / "training.resolved.yaml", train_cfg_dict)
+    write_yaml(snap_dir / "model.resolved.yaml", model_cfg)
+    write_yaml(snap_dir / "full.resolved.yaml", full_cfg_dict)
+
+    manifest: list[dict[str, str]] = []
+    for i, p in enumerate(config_files):
+        src = Path(p)
+        if not src.exists() or not src.is_file():
+            manifest.append({"src": str(src), "dst": ""})
+            continue
+        dst = sources_dir / f"{i:02d}_{src.name}"
+        shutil.copy2(src, dst)
+        manifest.append({"src": str(src), "dst": str(dst)})
+    (snap_dir / "sources_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+    return snap_dir
+
+
+@torch.no_grad()
+def _weight_l2_norm(model: nn.Module) -> float:
+    total_sq = 0.0
+    for p in model.parameters():
+        v = p.detach()
+        total_sq += float(v.float().pow(2).sum().item())
+    return float(total_sq**0.5)
 
 
 def main() -> None:
@@ -342,6 +440,16 @@ def main() -> None:
 
     cfg_ns = parser.parse_args()
     cfg_dict = namespace_to_dict(cfg_ns)
+
+    extra_cfg_files = getattr(cfg_ns, "config", None)
+    if extra_cfg_files is None:
+        extra_cfg_list: list[str] = []
+    elif isinstance(extra_cfg_files, (list, tuple)):
+        extra_cfg_list = [str(x) for x in extra_cfg_files]
+    else:
+        extra_cfg_list = [str(extra_cfg_files)]
+    config_files = [str(default_model), str(default_train), *extra_cfg_list]
+    argv = sys.argv[1:]
 
     train_keys = {f.name for f in fields(TrainingConfig)}
     model_keys = (
@@ -396,8 +504,20 @@ def main() -> None:
             config={
                 "training": train_cfg_dict,
                 "model": model_cfg,
+                "cli": {"argv": argv, "config_files": config_files},
             },
         )
+        # Make W&B plots less confusing:
+        # - epoch-level metrics plot against `epoch`
+        # - batch timing plots against `global_step`
+        wandb.define_metric("epoch")
+        wandb.define_metric("global_step")
+        wandb.define_metric("train/*", step_metric="epoch")
+        wandb.define_metric("test/*", step_metric="epoch")
+        wandb.define_metric("model/*", step_metric="epoch")
+        wandb.define_metric("time/epoch_sec", step_metric="epoch")
+        wandb.define_metric("time/avg_batch_sec", step_metric="epoch")
+        wandb.define_metric("time/batch_sec", step_metric="global_step")
         wandb_run.log({"device": str(device)})
 
     ckpt_dir = checkpoint_dir(
@@ -405,14 +525,35 @@ def main() -> None:
         project=project_name,
         name=effective_run_name,
     )
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    snap_dir = _save_config_snapshot(
+        ckpt_dir=ckpt_dir,
+        train_cfg_dict=train_cfg_dict,
+        model_cfg=model_cfg,
+        full_cfg_dict=cfg_dict,
+        config_files=config_files,
+        argv=argv,
+    )
+
+    if wandb_run is not None:
+        import wandb  # type: ignore
+
+        artifact = wandb.Artifact(name=f"{effective_run_name}-config", type="config")
+        artifact.add_dir(str(snap_dir))
+        wandb_run.log_artifact(artifact)
+
+    global_step = 0
     for epoch in range(1, int(train_cfg.n_epochs) + 1):
-        train_metrics = train_one_epoch(
+        train_metrics, train_timing, global_step = train_one_epoch(
             model=model,
             loader=train_loader,
             optimizer=optimizer,
             device=device,
             log_every_steps=int(train_cfg.log_every_steps),
+            wandb_run=wandb_run,
+            epoch=int(epoch),
+            global_step=int(global_step),
         )
         test_metrics = evaluate(model=model, loader=test_loader, device=device)
         print(
@@ -422,15 +563,19 @@ def main() -> None:
         )
 
         if wandb_run is not None:
+            weight_norm = _weight_l2_norm(model)
             wandb_run.log(
                 {
                     "epoch": epoch,
+                    "global_step": int(global_step),
                     "train/loss": float(train_metrics["loss"]),
                     "train/acc": float(train_metrics["acc"]),
                     "test/loss": float(test_metrics["loss"]),
                     "test/acc": float(test_metrics["acc"]),
+                    "model/weight_norm_l2": float(weight_norm),
+                    **{k: float(v) for k, v in train_timing.items()},
                 },
-                step=epoch,
+                step=int(global_step),
             )
 
         if int(train_cfg.checkpoint_every_epochs) > 0 and epoch % int(train_cfg.checkpoint_every_epochs) == 0:

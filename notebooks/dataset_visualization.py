@@ -38,6 +38,11 @@ noise_cfg = NoiseTagConfig(
     distribution="uniform",
     cache_images=True,
     label_format="onehot",
+    # Optional augmentation suite (train-only by default in loaders; this notebook
+    # instantiates the dataset directly so augmentations apply here if enabled).
+    augment=False,
+    augment_shift_max=27,
+    augment_gaussian_std=0.02,
 )
 
 

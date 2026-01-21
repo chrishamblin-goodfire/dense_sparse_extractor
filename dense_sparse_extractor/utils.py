@@ -78,3 +78,84 @@ def save_checkpoint(
     torch.save(payload, ckpt_dir / "latest.pt")
     return ckpt_path
 
+
+def yaml_scalar(x: Any) -> str:
+    # YAML 1.2 is a superset of JSON, so JSON scalars/strings are valid YAML.
+    import json
+
+    if x is None:
+        return "null"
+    if isinstance(x, bool):
+        return "true" if x else "false"
+    if isinstance(x, (int, float)):
+        return repr(x)
+    if isinstance(x, str):
+        return json.dumps(x)
+    return json.dumps(str(x))
+
+
+def yaml_key(k: Any) -> str:
+    import json
+
+    s = str(k)
+    if s and all(ch.isalnum() or ch in ("_", "-", ".") for ch in s):
+        return s
+    return json.dumps(s)
+
+
+def yaml_dump_lines(obj: Any, *, indent: int = 0) -> list[str]:
+    sp = "  " * int(indent)
+
+    if isinstance(obj, dict):
+        if not obj:
+            return [sp + "{}"]
+        out: list[str] = []
+        for k in sorted(obj.keys(), key=lambda x: str(x)):
+            v = obj[k]
+            key = yaml_key(k)
+            if isinstance(v, dict):
+                if not v:
+                    out.append(f"{sp}{key}: {{}}")
+                else:
+                    out.append(f"{sp}{key}:")
+                    out.extend(yaml_dump_lines(v, indent=indent + 1))
+            elif isinstance(v, (list, tuple)):
+                if len(v) == 0:
+                    out.append(f"{sp}{key}: []")
+                else:
+                    out.append(f"{sp}{key}:")
+                    out.extend(yaml_dump_lines(list(v), indent=indent + 1))
+            else:
+                out.append(f"{sp}{key}: {yaml_scalar(v)}")
+        return out
+
+    if isinstance(obj, (list, tuple)):
+        seq = list(obj)
+        if not seq:
+            return [sp + "[]"]
+        out: list[str] = []
+        for item in seq:
+            if isinstance(item, dict):
+                if not item:
+                    out.append(f"{sp}- {{}}")
+                else:
+                    out.append(f"{sp}-")
+                    out.extend(yaml_dump_lines(item, indent=indent + 1))
+            elif isinstance(item, (list, tuple)):
+                if len(item) == 0:
+                    out.append(f"{sp}- []")
+                else:
+                    out.append(f"{sp}-")
+                    out.extend(yaml_dump_lines(list(item), indent=indent + 1))
+            else:
+                out.append(f"{sp}- {yaml_scalar(item)}")
+        return out
+
+    return [sp + yaml_scalar(obj)]
+
+
+def write_yaml(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = "\n".join(yaml_dump_lines(obj)) + "\n"
+    path.write_text(text, encoding="utf-8")
+

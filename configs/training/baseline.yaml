@@ -8,7 +8,7 @@ device: auto # "auto" | "cpu" | "cuda"
 
 data_dir: ./data
 batch_size: 256
-num_workers: 4
+num_workers: 6
 pin_memory: true
 
 # Which dataset to train on:
@@ -25,6 +25,13 @@ noise_tags:
   distribution: uniform # "uniform" | "normal"
   cache_images: true
   label_format: int # "int" | "onehot"
+  # Optional: restrict the tag vocabulary (digits). If null, uses all 0..9.
+  # classes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  # Optional augmentation suite (train-only by default):
+  augment: false
+  # augment_shift_max: 27       # cyclic wrap-around shift in pixels (28x28 -> max meaningful is 27)
+  # augment_gaussian_std: 0.02  # extra small Gaussian noise in [0,1] space
+  # augment_apply_to_test: false
 
 # Combined dataset options (used when dataset=combined)
 combined:
@@ -41,7 +48,7 @@ lr: 0.0001
 weight_decay: 0.001
 momentum: 0.9 # only used for sgd
 
-n_epochs: 1000
+n_epochs: 5000
 log_every_steps: 100
 
 # Checkpointing

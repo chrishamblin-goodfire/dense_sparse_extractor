@@ -116,10 +116,26 @@ def make_noise_tag_datasets(*, cfg: NoiseTagConfig) -> tuple[Dataset, Dataset]:
     """
     Create train/test synthetic noise-tag datasets.
 
-    We generate train and test sets with different RNG seeds to avoid overlap.
+    Train/test synthetic noise-tag datasets.
+
+    By design, we evaluate on the *same underlying noise images* as training
+    (same cfg.seed). This avoids any "unseen noise image" generalization
+    requirement for the noise-tag setting.
+
+    Both splits always share the same tag vocabulary (cfg.classes, or digits 0..9).
+
+    By default, augmentations (if enabled in cfg) are applied to train only.
     """
     train_ds = NoiseTagDataset(cfg)
-    test_cfg = replace(cfg, seed=int(cfg.seed) + 1)
+    # Keep the same base noise images for evaluation.
+    test_cfg = replace(cfg, seed=int(cfg.seed))
+    if bool(cfg.augment) and not bool(cfg.augment_apply_to_test):
+        test_cfg = replace(
+            test_cfg,
+            augment=False,
+            augment_shift_max=0,
+            augment_gaussian_std=0.0,
+        )
     test_ds = NoiseTagDataset(test_cfg)
     return train_ds, test_ds
 
@@ -158,12 +174,27 @@ def make_noise_tag_loaders(
 
 @dataclass(frozen=True)
 class NoiseTagConfig:
-    images_per_class: int = 256
+    images_per_class: int = 200
     seed: int = 0
     normalize_like_mnist: bool = True
     distribution: NoiseDistribution = "uniform"
     cache_images: bool = True
     label_format: LabelFormat = "onehot"
+    # Optional subset of MNIST digit-tags to generate. If None, uses all digits 0..9.
+    # This is useful if you want to restrict the tag vocabulary, while still ensuring
+    # train/test share the exact same set of tags.
+    classes: tuple[int, ...] | None = None
+
+    # Optional augmentation suite (applied in [0,1] space before normalization).
+    # Defaults keep behavior identical to the pre-augmentation dataset.
+    augment: bool = True
+    # Cyclic shift (wrap-around) in pixels. 0 disables shifting.
+    # Default 27 allows any non-trivial cyclic shift on 28x28 images.
+    augment_shift_max: int = 27
+    # Additional small Gaussian noise (std in [0,1] pixel space). 0 disables.
+    augment_gaussian_std: float = 0.0
+    # By default, augmentations are train-only; test uses clean samples.
+    augment_apply_to_test: bool = False
 
 
 class NoiseTagDataset(Dataset):
@@ -180,12 +211,27 @@ class NoiseTagDataset(Dataset):
         if self.images_per_class <= 0:
             raise ValueError("images_per_class must be > 0")
 
-        self._cache: torch.Tensor | None = None
+        # Which digit-tags exist in this dataset.
+        if cfg.classes is None:
+            classes = list(range(MNIST_NUM_CLASSES))
+        else:
+            classes = [int(c) for c in cfg.classes]
+            if not classes:
+                raise ValueError("classes must be None or a non-empty tuple of ints")
+            if any((c < 0 or c >= MNIST_NUM_CLASSES) for c in classes):
+                raise ValueError(f"classes must be in [0, {MNIST_NUM_CLASSES - 1}]")
+            if len(set(classes)) != len(classes):
+                raise ValueError("classes must not contain duplicates")
+        self.classes: tuple[int, ...] = tuple(classes)
+
+        # Cache stores base images in [0,1] space (pre-normalization), so that
+        # augmentations (if enabled) can be applied on-the-fly.
+        self._cache_01: torch.Tensor | None = None
         if bool(cfg.cache_images):
-            self._cache = self._generate_all()
+            self._cache_01 = self._generate_all_01()
 
     def __len__(self) -> int:
-        return MNIST_NUM_CLASSES * self.images_per_class
+        return len(self.classes) * self.images_per_class
 
     def _postprocess(self, x01: torch.Tensor) -> torch.Tensor:
         # x01 is expected in [0, 1] range.
@@ -202,22 +248,21 @@ class NoiseTagDataset(Dataset):
             return x.clamp_(0.0, 1.0)
         raise ValueError(f"Unknown distribution: {self.cfg.distribution}")
 
-    def _generate_one(self, cls: int, j: int) -> torch.Tensor:
+    def _generate_one_01(self, cls: int, j: int) -> torch.Tensor:
         g = torch.Generator()
         # Deterministic per-(cls, j) sampling.
         g.manual_seed(int(self.cfg.seed) + cls * 1_000_003 + j * 10_007)
-        x01 = self._sample_noise_01(generator=g)
-        return self._postprocess(x01)
+        return self._sample_noise_01(generator=g)
 
-    def _generate_all(self) -> torch.Tensor:
-        # Shape: (10, images_per_class, 1, 28, 28)
+    def _generate_all_01(self) -> torch.Tensor:
+        # Shape: (num_classes, images_per_class, 1, 28, 28) in [0,1].
         imgs = torch.empty(
-            (MNIST_NUM_CLASSES, self.images_per_class, *MNIST_IMAGE_SHAPE),
+            (len(self.classes), self.images_per_class, *MNIST_IMAGE_SHAPE),
             dtype=torch.float32,
         )
-        for cls in range(MNIST_NUM_CLASSES):
+        for i, cls in enumerate(self.classes):
             for j in range(self.images_per_class):
-                imgs[cls, j] = self._generate_one(cls, j)
+                imgs[i, j] = self._generate_one_01(int(cls), j)
         return imgs
 
     def _format_label(self, cls: int):
@@ -226,15 +271,51 @@ class NoiseTagDataset(Dataset):
         y = F.one_hot(torch.as_tensor(int(cls), dtype=torch.long), num_classes=MNIST_NUM_CLASSES)
         return y.to(torch.float32)
 
+    def _maybe_augment_01(self, x01: torch.Tensor, *, cls: int, j: int) -> torch.Tensor:
+        if not bool(self.cfg.augment):
+            return x01
+
+        # Deterministic per-sample augmentation (no epoch dependence).
+        g = torch.Generator()
+        g.manual_seed(int(self.cfg.seed) + cls * 1_000_003 + j * 10_007 + 999_983)
+
+        out = x01
+
+        m = int(self.cfg.augment_shift_max)
+        if m > 0:
+            dx = int(torch.randint(-m, m + 1, (1,), generator=g).item())
+            dy = int(torch.randint(-m, m + 1, (1,), generator=g).item())
+            # Ensure we actually shift (avoid the (0,0) no-op).
+            if dx == 0 and dy == 0:
+                dx = 1 if m >= 1 else 0
+            if dx != 0 or dy != 0:
+                # x01 shape is (1, H, W); roll dims (H, W) => dims (1, 2)
+                out = torch.roll(out, shifts=(dy, dx), dims=(1, 2))
+
+        std = float(self.cfg.augment_gaussian_std)
+        if std > 0.0:
+            n = torch.randn(out.shape, generator=g, dtype=out.dtype) * std
+            out = (out + n).clamp_(0.0, 1.0)
+
+        return out
+
     def __getitem__(self, idx: int):
         if idx < 0 or idx >= len(self):
             raise IndexError(idx)
-        cls = int(idx // self.images_per_class)
+        cls_i = int(idx // self.images_per_class)
+        cls = int(self.classes[cls_i])
         j = int(idx % self.images_per_class)
-        if self._cache is not None:
-            x = self._cache[cls, j]
+        if self._cache_01 is not None:
+            x01 = self._cache_01[cls_i, j]
         else:
-            x = self._generate_one(cls, j)
+            x01 = self._generate_one_01(cls, j)
+
+        # Clone if cached so we never mutate the cache in-place during augmentation.
+        if self._cache_01 is not None:
+            x01 = x01.clone()
+
+        x01 = self._maybe_augment_01(x01, cls=cls, j=j)
+        x = self._postprocess(x01)
         y = self._format_label(cls)
         return x, y
 

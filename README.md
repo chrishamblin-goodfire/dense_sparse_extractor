@@ -43,6 +43,15 @@ dataset: combined
 - **`noise_tags`**: synthetic noise images with digit tags (int labels -> `CrossEntropyLoss`; onehot -> `BCEWithLogitsLoss`)
 - **`combined`**: pixelwise sums MNIST + noise; **multi-hot** targets (uses `BCEWithLogitsLoss`)
 
+### Noise tag augmentations (optional)
+
+The `noise_tags` dataset can optionally apply simple, deterministic augmentations in \([0,1]\) pixel space:
+
+- **cyclic shift**: wrap-around pixel roll (set `augment_shift_max > 0`)
+- **extra Gaussian noise**: small additive noise (set `augment_gaussian_std > 0`)
+
+Augmentations are **train-only by default** (test is kept “clean”) via `augment_apply_to_test: false`.
+
 ## Weights & Biases (wandb)
 
 W&B logging is **optional** and enabled via `wandb_enabled: true` in the training YAML.
@@ -75,4 +84,3 @@ Then run:
 ```bash
 python -m dense_sparse_extractor.train --train_config configs/training/my_run.yaml
 ```
-

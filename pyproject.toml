@@ -15,6 +15,10 @@ dependencies = [
   "tqdm",
   "matplotlib",
   "ipykernel",
+  "wandb",
+  "jsonargparse",
+  "numpy",
+  "overcomplete>=0.3.0",
 ]
 
 [tool.setuptools]
