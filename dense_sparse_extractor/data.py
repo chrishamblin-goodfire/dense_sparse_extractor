@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Sequence
 
@@ -90,6 +90,50 @@ def make_mnist_loaders(
         label_format=label_format,
         download=download,
     )
+
+    effective_pin_memory = bool(pin_memory)
+    if device is not None:
+        effective_pin_memory = effective_pin_memory and device.type == "cuda"
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=int(batch_size),
+        shuffle=bool(shuffle_train),
+        num_workers=int(num_workers),
+        pin_memory=effective_pin_memory,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=int(batch_size),
+        shuffle=False,
+        num_workers=int(num_workers),
+        pin_memory=effective_pin_memory,
+    )
+    return train_loader, test_loader
+
+
+def make_noise_tag_datasets(*, cfg: NoiseTagConfig) -> tuple[Dataset, Dataset]:
+    """
+    Create train/test synthetic noise-tag datasets.
+
+    We generate train and test sets with different RNG seeds to avoid overlap.
+    """
+    train_ds = NoiseTagDataset(cfg)
+    test_cfg = replace(cfg, seed=int(cfg.seed) + 1)
+    test_ds = NoiseTagDataset(test_cfg)
+    return train_ds, test_ds
+
+
+def make_noise_tag_loaders(
+    *,
+    cfg: NoiseTagConfig,
+    batch_size: int,
+    shuffle_train: bool = True,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+    device: torch.device | None = None,
+) -> tuple[DataLoader, DataLoader]:
+    train_ds, test_ds = make_noise_tag_datasets(cfg=cfg)
 
     effective_pin_memory = bool(pin_memory)
     if device is not None:
@@ -298,6 +342,86 @@ class CombinedDataset(Dataset):
         y_sum = torch.stack(ys, dim=0).sum(dim=0)
         y_mh = y_sum.clamp(0.0, 1.0)
         return x_sum, y_mh
+
+
+def make_combined_datasets(
+    *,
+    data_dir: str | Path,
+    noise_cfg: NoiseTagConfig,
+    mnist_normalize: bool = True,
+    download: bool = True,
+    seed: int = 0,
+    length: int | None = None,
+    clip: tuple[float, float] | None = None,
+) -> tuple[Dataset, Dataset]:
+    """
+    Create train/test CombinedDataset datasets from:
+    - MNIST (one-hot labels)
+    - NoiseTagDataset (one-hot labels)
+
+    Output labels are multi-hot float vectors, suitable for multi-label training.
+    """
+    # Ensure MNIST + noise both produce label vectors so CombinedDataset can OR them.
+    mnist_train, mnist_test = make_mnist_datasets(
+        data_dir=data_dir,
+        normalize=bool(mnist_normalize),
+        label_format="onehot",
+        download=bool(download),
+    )
+
+    # Enforce one-hot for combined labels, even if the caller passed int.
+    effective_noise_cfg = noise_cfg if noise_cfg.label_format == "onehot" else replace(noise_cfg, label_format="onehot")
+    noise_train, noise_test = make_noise_tag_datasets(cfg=effective_noise_cfg)
+
+    train_ds = CombinedDataset([mnist_train, noise_train], seed=int(seed), length=length, num_classes=None, clip=clip)
+    test_ds = CombinedDataset([mnist_test, noise_test], seed=int(seed) + 1, length=length, num_classes=None, clip=clip)
+    return train_ds, test_ds
+
+
+def make_combined_loaders(
+    *,
+    data_dir: str | Path,
+    noise_cfg: NoiseTagConfig,
+    batch_size: int,
+    shuffle_train: bool = True,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+    mnist_normalize: bool = True,
+    download: bool = True,
+    seed: int = 0,
+    length: int | None = None,
+    clip: tuple[float, float] | None = None,
+    device: torch.device | None = None,
+) -> tuple[DataLoader, DataLoader]:
+    train_ds, test_ds = make_combined_datasets(
+        data_dir=data_dir,
+        noise_cfg=noise_cfg,
+        mnist_normalize=mnist_normalize,
+        download=download,
+        seed=seed,
+        length=length,
+        clip=clip,
+    )
+
+    effective_pin_memory = bool(pin_memory)
+    if device is not None:
+        effective_pin_memory = effective_pin_memory and device.type == "cuda"
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=int(batch_size),
+        shuffle=bool(shuffle_train),
+        num_workers=int(num_workers),
+        pin_memory=effective_pin_memory,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=int(batch_size),
+        shuffle=False,
+        num_workers=int(num_workers),
+        pin_memory=effective_pin_memory,
+    )
+    return train_loader, test_loader
 
 
 def denormalize_mnist(x: torch.Tensor) -> torch.Tensor:

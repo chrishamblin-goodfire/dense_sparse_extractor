@@ -1,23 +1,51 @@
+project_name: "dense-sparse-extractor_base_model"
+run_name: "mlp-mnist"
+wandb_enabled: True
+
 seed: 42
 
 device: auto # "auto" | "cpu" | "cuda"
 
 data_dir: ./data
-batch_size: 128
-num_workers: 2
+batch_size: 256
+num_workers: 6
 pin_memory: true
 
+# Which dataset to train on:
+# - "mnist": standard MNIST, integer class labels (CrossEntropyLoss)
+# - "noise_tags": synthetic noise images with digit tags (int labels -> CrossEntropyLoss; onehot -> BCEWithLogitsLoss)
+# - "combined": pixelwise add MNIST + noise images; multi-hot labels (BCEWithLogitsLoss)
+dataset: mnist # "mnist" | "noise_tags" | "combined"
+
+# Noise tag dataset options (used when dataset=noise_tags, and as defaults for dataset=combined)
+noise_tags:
+  images_per_class: 200
+  seed: 0
+  normalize_like_mnist: true
+  distribution: uniform # "uniform" | "normal"
+  cache_images: true
+  label_format: int # "int" | "onehot"
+
+# Combined dataset options (used when dataset=combined)
+combined:
+  seed: 0
+  length: null # null -> max(len(component_datasets))
+  clip: null   # null or [lo, hi] to clamp summed images
+  # You can override noise tag settings specifically for the combined dataset here:
+  # noise_tags:
+  #   images_per_class: 64
+  #   distribution: normal
+
 optimizer: adamw # "adamw" | "adam" | "sgd"
-lr: 0.001
-weight_decay: 0.01
+lr: 0.0001
+weight_decay: 0.001
 momentum: 0.9 # only used for sgd
 
-n_epochs: 5
+n_epochs: 1000
 log_every_steps: 100
 
-# Optional Weights & Biases logging
-# If enabled, you must set at least `wandb.project`.
-wandb:
-  enabled: false
-  project: "dense-sparse-extractor_base_model"
-  name: "mlp-baseline"
+# Checkpointing
+# Saves full training state (model + optimizer) every N epochs.
+# Set to 0 to disable.
+checkpoint_every_epochs: 10
+checkpoint_root: ./checkpoints

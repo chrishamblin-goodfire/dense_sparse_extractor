@@ -18,3 +18,8 @@ dist/
 # Jupyter / notebooks
 .ipynb_checkpoints/
 
+# folders
+checkpoints/
+wandb/
+data/
+

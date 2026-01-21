@@ -1,0 +1,19 @@
+model_type: vit
+
+# MNIST: 1x28x28 -> 10 classes
+image_size: 28
+patch_size: 4
+in_channels: 1
+num_classes: 10
+
+# Small ViT defaults (matches ViTConfig in dense_sparse_extractor/models/vit.py)
+embed_dim: 128
+depth: 4
+num_heads: 4
+mlp_ratio: 4.0
+
+dropout: 0.1
+attn_dropout: 0.1
+layer_norm_eps: 1.0e-5
+activation: gelu
+

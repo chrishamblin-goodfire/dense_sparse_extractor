@@ -30,17 +30,30 @@ python -m dense_sparse_extractor.train \
   --train_config configs/training/baseline.yaml
 ```
 
+### Dataset selection
+
+Choose the training dataset in the training YAML via `dataset`:
+
+```yaml
+# "mnist" | "noise_tags" | "combined"
+dataset: combined
+```
+
+- **`mnist`**: integer digit labels (uses `CrossEntropyLoss`)
+- **`noise_tags`**: synthetic noise images with digit tags (int labels -> `CrossEntropyLoss`; onehot -> `BCEWithLogitsLoss`)
+- **`combined`**: pixelwise sums MNIST + noise; **multi-hot** targets (uses `BCEWithLogitsLoss`)
+
 ## Weights & Biases (wandb)
 
-W&B logging is **optional** and configured via the training YAML under `wandb:`.
-
-- **Minimal config** (enables logging):
-  - Set `wandb.enabled: true`
-  - Set `wandb.project: <your-project>`
+W&B logging is **optional** and enabled via `wandb_enabled: true` in the training YAML.
 
 Example `configs/training/my_run.yaml`:
 
 ```yaml
+project_name: dense-sparse-extractor
+run_name: mlp-baseline-run-1
+wandb_enabled: true
+
 seed: 42
 device: auto
 data_dir: ./data
@@ -55,15 +68,6 @@ momentum: 0.9
 
 n_epochs: 5
 log_every_steps: 100
-
-wandb:
-  enabled: true
-  project: dense-sparse-extractor
-  name: mlp-baseline-run-1
-  # entity: your_team_or_user
-  # tags: ["baseline", "mnist"]
-  # notes: "first run"
-  # mode: "offline"   # or "online" / "disabled"
 ```
 
 Then run:
