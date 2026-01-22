@@ -12,6 +12,7 @@ source .venv/bin/activate
 uv pip install -r requirements.txt
 uv pip install -e .
 python -m ipykernel install --user --name=dense_sparse_extractor --display-name="Dense Sparse Extractor"
+./data/download_tiny_imagenet.sh
 ```
 
 ## Training

@@ -1,5 +1,5 @@
 project_name: "dense-sparse-extractor_base_model"
-run_name: "mlp-mnist"
+run_name: "vit-mnist_lowfeq"
 wandb_enabled: True
 
 seed: 42
@@ -8,14 +8,23 @@ device: auto # "auto" | "cpu" | "cuda"
 
 data_dir: ./data
 batch_size: 256
-num_workers: 6
+num_workers: 4
 pin_memory: true
 
 # Which dataset to train on:
 # - "mnist": standard MNIST, integer class labels (CrossEntropyLoss)
 # - "noise_tags": synthetic noise images with digit tags (int labels -> CrossEntropyLoss; onehot -> BCEWithLogitsLoss)
 # - "combined": pixelwise add MNIST + noise images; multi-hot labels (BCEWithLogitsLoss)
-dataset: mnist # "mnist" | "noise_tags" | "combined"
+dataset: combined # "mnist" | "noise_tags" | "lowfreq_tag" | "combined"
+
+# MNIST augmentation options (used when dataset=mnist, and as defaults for dataset=combined.mnist)
+# Augmentations are applied in [0,1] space before normalization.
+mnist:
+  augment: true
+  brightness_clip_min: 0.5
+  jitter_crop: 2
+  gaussian_std: 0.03
+  augment_apply_to_test: false
 
 # Noise tag dataset options (used when dataset=noise_tags, and as defaults for dataset=combined)
 noise_tags:
@@ -28,24 +37,51 @@ noise_tags:
   # Optional: restrict the tag vocabulary (digits). If null, uses all 0..9.
   # classes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
   # Optional augmentation suite (train-only by default):
-  augment: false
+  augment: true
+  augment_apply_to_test: false
   # augment_shift_max: 27       # cyclic wrap-around shift in pixels (28x28 -> max meaningful is 27)
   # augment_gaussian_std: 0.02  # extra small Gaussian noise in [0,1] space
   # augment_apply_to_test: false
+
+# Lowfreq tag dataset options (used when dataset=lowfreq_tag)
+lowfreq_tag:
+  images_per_class: 200
+  seed: 0
+  normalize_like_mnist: true
+  cache_images: true
+  label_format: onehot
+  magnitude_num_images: 2048
+  magnitude_seed: 0
+  lowfreq_boost: 0.8
+  augment: true
+  augment_jitter_max: 2
+  augment_gaussian_std: 0.0
+  augment_apply_to_test: false
 
 # Combined dataset options (used when dataset=combined)
 combined:
   seed: 0
   length: null # null -> max(len(component_datasets))
   clip: null   # null or [lo, hi] to clamp summed images
+  # Which datasets to combine. If omitted/null, defaults to ["mnist", "noise_tags"].
+  # Examples:
+  # datasets: ["mnist", "noise_tags"]
+  # datasets: ["mnist", "lowfreq_tag"]
+  # datasets: ["mnist", "noise_tags", "lowfreq_tag"]
+  datasets: ["mnist", "lowfreq_tag"]
+  # Use MNIST augmentation defaults unless overridden here:
+  #mnist: {}
   # You can override noise tag settings specifically for the combined dataset here:
   # noise_tags:
   #   images_per_class: 64
   #   distribution: normal
+  # You can override lowfreq settings specifically for the combined dataset here:
+  # lowfreq_tag:
+  #   augment_gaussian_std: 0.01
 
 optimizer: adamw # "adamw" | "adam" | "sgd"
 lr: 0.0001
-weight_decay: 0.001
+weight_decay: 0.005
 momentum: 0.9 # only used for sgd
 
 n_epochs: 5000

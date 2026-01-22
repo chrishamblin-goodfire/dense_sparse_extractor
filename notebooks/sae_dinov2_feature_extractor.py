@@ -24,13 +24,15 @@
 #
 # ### Assumptions
 #
-# - You have a sibling checkout at `../dinov2` (relative to this repo root).
+# - You have DINOv2 vendored into this repo at `dense_sparse_extractor/models/dino_v2`
+#   (or `dense_sparse_extractor/models/dinov2`).
 # - You installed this repo requirements (see `requirements.txt`).
 
 # %%
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
 import torch
 from torch.utils.data import DataLoader
@@ -40,18 +42,54 @@ from torchvision import transforms
 from overcomplete.sae import TopKSAE, train_sae
 
 
-def get_projects_dir() -> Path:
-    # If you run this notebook from the repo root, this resolves to ../
+def find_repo_root() -> Path:
+    """
+    Find the `dense_sparse_extractor` repo root without assuming anything outside it.
+    """
     cwd = Path.cwd().resolve()
-    if cwd.name == "dense_sparse_extractor":
-        return cwd.parent
-    # Fallback: walk up until we find this repo root, then take its parent.
     for p in [cwd, *cwd.parents]:
-        if (p / "dense_sparse_extractor").is_dir() and (p / "dinov2").is_dir():
-            return p
         if (p / "pyproject.toml").is_file() and (p / "dense_sparse_extractor").is_dir():
-            return p.parent
-    raise RuntimeError("Could not infer projects dir. Run from the repo root.")
+            return p
+    raise RuntimeError("Could not find repo root. Run from the repo root (the folder containing pyproject.toml).")
+
+
+def ensure_dinov2_repo(repo_root: Path) -> Path:
+    """
+    Ensure DINOv2 is available inside this repo (auto-download if missing).
+
+    Uses a single canonical location:
+      - dense_sparse_extractor/models/dino_v2/
+    """
+    target_dir = repo_root / "dense_sparse_extractor" / "models" / "dino_v2"
+    hubconf = target_dir / "hubconf.py"
+
+    if hubconf.is_file():
+        return target_dir
+
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+    if target_dir.exists() and not hubconf.is_file():
+        # Directory exists but isn't a usable DINOv2 checkout.
+        raise FileNotFoundError(
+            f"Found {target_dir}, but it doesn't look like a DINOv2 checkout (missing hubconf.py). "
+            "Delete it or replace it with the DINOv2 repo."
+        )
+
+    print(f"[info] DINOv2 not found; cloning into: {target_dir}")
+    try:
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "https://github.com/facebookresearch/dinov2.git", str(target_dir)],
+            check=True,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to download DINOv2 automatically. "
+            "Make sure you have `git` installed and network access, or clone it manually into "
+            f"{target_dir}."
+        ) from e
+
+    if not hubconf.is_file():
+        raise RuntimeError(f"DINOv2 clone completed but {hubconf} is still missing.")
+    return target_dir
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -59,10 +97,8 @@ device
 
 # %%
 # Load DINOv2 from a local checkout via torch.hub
-projects_dir = get_projects_dir()
-dinov2_dir = projects_dir / "dinov2"
-if not dinov2_dir.is_dir():
-    raise FileNotFoundError(f"Expected dinov2 checkout at: {dinov2_dir}")
+repo_root = find_repo_root()
+dinov2_dir = ensure_dinov2_repo(repo_root)
 
 
 def load_dinov2_backbone(*, repo_dir: Path, name: str = "dinov2_vits14", device: str, pretrained: bool = True):
@@ -133,3 +169,5 @@ with torch.no_grad():
     _, codes = sae.encode(activations)  # (B*N, nb_concepts) with top_k non-zeros
 
 codes.shape, (codes != 0).float().sum(dim=-1).mean().item()
+
+# %%

@@ -23,4 +23,5 @@ checkpoints/
 wandb/
 data/
 logs/
+models/
 

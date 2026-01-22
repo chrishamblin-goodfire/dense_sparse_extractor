@@ -4,6 +4,6 @@ model_type: mlp
 in_dim: 784
 num_classes: 10
 
-hidden_sizes: [256, 256]
-dropout: 0.1
+hidden_sizes: [512, 512, 256]
+dropout: 0.0
 activation: gelu

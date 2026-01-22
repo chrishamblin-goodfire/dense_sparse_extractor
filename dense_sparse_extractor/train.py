@@ -14,7 +14,15 @@ from jsonargparse import ActionConfigFile, ArgumentParser, namespace_to_dict
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .data import NoiseTagConfig, make_combined_loaders, make_mnist_loaders, make_noise_tag_loaders
+from .data import (
+    MNISTAugmentConfig,
+    LowFreqTagConfig,
+    NoiseTagConfig,
+    make_combined_loaders,
+    make_lowfreq_tag_loaders,
+    make_mnist_loaders,
+    make_noise_tag_loaders,
+)
 from .models.convnet import ConvNetConfig, MNISTConvNet
 from .models.mlp import MLPConfig, MNISTMLP
 from .models.vit import ViTConfig, MNISTViT
@@ -22,7 +30,7 @@ from .utils import checkpoint_dir, pick_unique_run_name, save_checkpoint, write_
 
 
 ModelType = Literal["mlp", "convnet", "vit"]
-DatasetType = Literal["mnist", "noise_tags", "combined"]
+DatasetType = Literal["mnist", "noise_tags", "lowfreq_tag", "combined"]
 
 
 @dataclass(frozen=True)
@@ -41,9 +49,11 @@ class TrainingConfig:
     pin_memory: bool = True
 
     # Data selection
-    dataset: DatasetType = "mnist"  # "mnist" | "noise_tags" | "combined"
+    dataset: DatasetType = "mnist"  # "mnist" | "noise_tags" | "lowfreq_tag" | "combined"
     # Extra dataset-specific config blobs (parsed from YAML)
+    mnist: dict[str, Any] = field(default_factory=dict)
     noise_tags: dict[str, Any] = field(default_factory=dict)
+    lowfreq_tag: dict[str, Any] = field(default_factory=dict)
     combined: dict[str, Any] = field(default_factory=dict)
 
     optimizer: str = "adamw"  # "adamw" | "adam" | "sgd"
@@ -148,10 +158,33 @@ def _merged_noise_cfg(noise_cfg_dict: dict[str, Any]) -> NoiseTagConfig:
     return NoiseTagConfig(**filtered)
 
 
+def _merged_mnist_aug_cfg(mnist_cfg_dict: dict[str, Any]) -> MNISTAugmentConfig:
+    """
+    Create an MNISTAugmentConfig from a (possibly partial) YAML mapping.
+    Unknown keys are ignored to keep configs forward-compatible.
+    """
+    allowed = {f.name for f in fields(MNISTAugmentConfig)}
+    filtered = {k: v for k, v in dict(mnist_cfg_dict).items() if k in allowed}
+    return MNISTAugmentConfig(**filtered)
+
+
+def _merged_lowfreq_cfg(lowfreq_cfg_dict: dict[str, Any]) -> LowFreqTagConfig:
+    """
+    Create a LowFreqTagConfig from a (possibly partial) YAML mapping.
+    Unknown keys are ignored to keep configs forward-compatible.
+    """
+    allowed = {f.name for f in fields(LowFreqTagConfig)}
+    filtered = {k: v for k, v in dict(lowfreq_cfg_dict).items() if k in allowed}
+    return LowFreqTagConfig(**filtered)
+
+
 def _make_loaders(*, cfg: TrainingConfig, device: torch.device) -> tuple[DataLoader, DataLoader]:
     data_dir = Path(cfg.data_dir)
 
     if cfg.dataset == "mnist":
+        mnist_aug = None
+        if isinstance(cfg.mnist, dict) and cfg.mnist:
+            mnist_aug = _merged_mnist_aug_cfg(cfg.mnist)
         return make_mnist_loaders(
             data_dir=data_dir,
             batch_size=int(cfg.batch_size),
@@ -161,6 +194,7 @@ def _make_loaders(*, cfg: TrainingConfig, device: torch.device) -> tuple[DataLoa
             normalize=True,
             label_format="int",
             download=True,
+            augment_cfg=mnist_aug,
             device=device,
         )
 
@@ -168,6 +202,18 @@ def _make_loaders(*, cfg: TrainingConfig, device: torch.device) -> tuple[DataLoa
         noise_cfg = _merged_noise_cfg(cfg.noise_tags)
         return make_noise_tag_loaders(
             cfg=noise_cfg,
+            batch_size=int(cfg.batch_size),
+            shuffle_train=True,
+            num_workers=int(cfg.num_workers),
+            pin_memory=bool(cfg.pin_memory),
+            device=device,
+        )
+
+    if cfg.dataset == "lowfreq_tag":
+        lowfreq_cfg = _merged_lowfreq_cfg(cfg.lowfreq_tag)
+        return make_lowfreq_tag_loaders(
+            data_dir=data_dir,
+            cfg=lowfreq_cfg,
             batch_size=int(cfg.batch_size),
             shuffle_train=True,
             num_workers=int(cfg.num_workers),
@@ -188,6 +234,13 @@ def _make_loaders(*, cfg: TrainingConfig, device: torch.device) -> tuple[DataLoa
                 raise ValueError("combined.clip must be null or a 2-element list/tuple like: [lo, hi]")
             clip_tuple = (float(clip[0]), float(clip[1]))
 
+        # Optional list of dataset tags to combine (default handled downstream).
+        combined_datasets = combined_cfg.get("datasets", combined_cfg.get("components", None))
+        if combined_datasets is not None:
+            if not isinstance(combined_datasets, (list, tuple)):
+                raise ValueError('combined.datasets must be null or a list like: ["mnist","noise_tags"]')
+            combined_datasets = [str(x) for x in combined_datasets]
+
         # Allow combined.noise_tags to override cfg.noise_tags
         noise_cfg_dict = dict(cfg.noise_tags)
         if isinstance(combined_cfg.get("noise_tags", None), dict):
@@ -195,9 +248,25 @@ def _make_loaders(*, cfg: TrainingConfig, device: torch.device) -> tuple[DataLoa
         # We enforce one-hot for combined downstream, but keep config parsing consistent.
         noise_cfg = _merged_noise_cfg(noise_cfg_dict)
 
+        # Allow combined.mnist to override cfg.mnist
+        mnist_cfg_dict = dict(cfg.mnist)
+        if isinstance(combined_cfg.get("mnist", None), dict):
+            mnist_cfg_dict.update(dict(combined_cfg["mnist"]))
+        mnist_aug = None
+        if mnist_cfg_dict:
+            mnist_aug = _merged_mnist_aug_cfg(mnist_cfg_dict)
+
+        # Allow combined.lowfreq_tag to override cfg.lowfreq_tag
+        lowfreq_cfg_dict = dict(cfg.lowfreq_tag)
+        if isinstance(combined_cfg.get("lowfreq_tag", None), dict):
+            lowfreq_cfg_dict.update(dict(combined_cfg["lowfreq_tag"]))
+        lowfreq_cfg = _merged_lowfreq_cfg(lowfreq_cfg_dict) if lowfreq_cfg_dict else None
+
         return make_combined_loaders(
             data_dir=data_dir,
             noise_cfg=noise_cfg,
+            lowfreq_cfg=lowfreq_cfg,
+            mnist_augment_cfg=mnist_aug,
             batch_size=int(cfg.batch_size),
             shuffle_train=True,
             num_workers=int(cfg.num_workers),
@@ -207,6 +276,7 @@ def _make_loaders(*, cfg: TrainingConfig, device: torch.device) -> tuple[DataLoa
             seed=combined_seed,
             length=combined_length,
             clip=clip_tuple,
+            datasets=combined_datasets,
             device=device,
         )
 
@@ -281,6 +351,13 @@ def train_one_epoch(
     interval_sum_sec = 0.0
     interval_count = 0
 
+    # Ensure epoch-dependent datasets (pairings/augmentations) update each epoch.
+    if epoch is not None and hasattr(loader.dataset, "set_epoch"):
+        try:
+            loader.dataset.set_epoch(int(epoch))  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
     pbar = tqdm(loader, desc="train", leave=False)
     for step, (x, y) in enumerate(pbar, start=1):
         batch_t0 = time.perf_counter()
@@ -320,6 +397,7 @@ def train_one_epoch(
             wandb_run.log(
                 {
                     "epoch": int(epoch) if epoch is not None else 0,
+                    "step": int(global_step),
                     "global_step": int(global_step),
                     "time/batch_sec": float(interval_sum_sec / max(1, interval_count)),
                 },
@@ -507,18 +585,14 @@ def main() -> None:
                 "cli": {"argv": argv, "config_files": config_files},
             },
         )
-        # Make W&B plots less confusing:
-        # - epoch-level metrics plot against `epoch`
-        # - batch timing plots against `global_step`
-        wandb.define_metric("epoch")
-        wandb.define_metric("global_step")
-        wandb.define_metric("train/*", step_metric="epoch")
-        wandb.define_metric("test/*", step_metric="epoch")
-        wandb.define_metric("model/*", step_metric="epoch")
-        wandb.define_metric("time/epoch_sec", step_metric="epoch")
-        wandb.define_metric("time/avg_batch_sec", step_metric="epoch")
-        wandb.define_metric("time/batch_sec", step_metric="global_step")
-        wandb_run.log({"device": str(device)})
+        # Standardize ALL W&B plots to use step on the x-axis.
+        # We still log `epoch` for readability, but it should not drive charts.
+        wandb.define_metric("step")
+        wandb.define_metric("*", step_metric="step")
+        wandb_run.log(
+            {"device": str(device), "step": 0, "global_step": 0, "epoch": 0},
+            step=0,
+        )
 
     ckpt_dir = checkpoint_dir(
         checkpoint_root=train_cfg.checkpoint_root,
@@ -567,6 +641,7 @@ def main() -> None:
             wandb_run.log(
                 {
                     "epoch": epoch,
+                    "step": int(global_step),
                     "global_step": int(global_step),
                     "train/loss": float(train_metrics["loss"]),
                     "train/acc": float(train_metrics["acc"]),
