@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import math
 from pathlib import Path
 from typing import Literal, Sequence
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -17,6 +19,244 @@ MNIST_IMAGE_SHAPE = (1, 28, 28)
 
 LabelFormat = Literal["int", "onehot"]
 NoiseDistribution = Literal["uniform", "normal"]
+
+
+def _stable_superellipse_radius(xu: np.ndarray, yv: np.ndarray, p_exp: float, eps: float = 1e-12) -> np.ndarray:
+    """
+    Stable computation of r = (xu^p + yv^p)^(1/p) for p>0, using log-sum-exp.
+
+    Adapted from `notebooks/loop_generator.py`.
+    """
+    p_exp = float(p_exp)
+    if not (p_exp > 0):
+        raise ValueError(f"p_exp must be > 0, got {p_exp}")
+
+    a = p_exp * np.log(xu + eps)
+    b = p_exp * np.log(yv + eps)
+    m = np.maximum(a, b)
+    log_sum = m + np.log(np.exp(a - m) + np.exp(b - m))
+    return np.exp(log_sum / p_exp)
+
+
+def generate_loop_image(
+    *,
+    size: float,
+    tx: float,
+    ty: float,
+    aspect: float,
+    rotation: float,
+    thickness: float,
+    brightness: float,
+    p_shape: float,
+    image_size: int = 28,
+    antialias: bool = True,
+) -> np.ndarray:
+    """
+    Generate a single (image_size x image_size) grayscale image with a loop (ring).
+
+    Output is float32 in [0,1].
+
+    Adapted from `notebooks/loop_generator.py`.
+    """
+    if image_size <= 0:
+        raise ValueError("image_size must be positive")
+    if size <= 0:
+        raise ValueError("size must be > 0")
+    if thickness <= 0:
+        raise ValueError("thickness must be > 0")
+    if aspect < 1:
+        raise ValueError("aspect must be >= 1 (major/minor ratio)")
+
+    brightness = float(np.clip(brightness, 0.5, 1.0))
+
+    # Semi-axes in pixels
+    b = float(size)  # minor
+    a = float(size * aspect)  # major
+
+    # Coordinate grid in pixel units, centered at image center.
+    c = (image_size - 1) / 2.0
+    xs = np.arange(image_size, dtype=np.float32)
+    ys = np.arange(image_size, dtype=np.float32)
+    xx, yy = np.meshgrid(xs, ys)
+    dx = (xx - c) - float(tx)
+    dy = (yy - c) - float(ty)
+
+    # Rotate coordinates by -rotation to rotate the shape by +rotation.
+    ct = float(np.cos(rotation))
+    st = float(np.sin(rotation))
+    u = ct * dx + st * dy
+    v = -st * dx + ct * dy
+
+    xu = np.abs(u) / a
+    yv = np.abs(v) / b
+
+    p_exp = 2.0 * float(np.exp(p_shape))
+    p_exp = float(np.clip(p_exp, 1e-3, 1e6))
+    r = _stable_superellipse_radius(xu, yv, p_exp=p_exp)  # boundary at r=1
+
+    # Convert thickness (pixels) into a band thickness in r-units (approx).
+    mean_radius = 0.5 * (a + b)
+    half_band = 0.5 * float(thickness) / mean_radius
+    # Anti-alias band edges across ~1 pixel in r-units.
+    edge = (0.5 / mean_radius) if antialias else 1e-9
+
+    dist = np.abs(r - 1.0)
+    alpha = np.clip((half_band - dist) / edge + 0.5, 0.0, 1.0)
+    img = (brightness * alpha).astype(np.float32)
+    return img
+
+
+@dataclass(frozen=True)
+class LoopConfig:
+    """
+    Synthetic 28x28 loop image dataset.
+
+    Sampling ranges match `notebooks/loop_generator.py`.
+    """
+
+    train_length: int = 60_000
+    test_length: int = 10_000
+    seed: int = 0
+
+    image_size: int = 28
+    antialias: bool = True
+
+    # Output domain control.
+    normalize_like_mnist: bool = False
+    label_format: LabelFormat = "onehot"
+
+    # Parameter ranges (copied from the demo in loop_generator.py)
+    size_min: float = 3.0
+    size_max: float = 6.0
+    tx_min: float = -10.0
+    tx_max: float = 10.0
+    ty_min: float = -10.0
+    ty_max: float = 10.0
+    aspect_min: float = 1.0
+    aspect_max: float = 3.0
+    rotation_min: float = 0.0
+    rotation_max: float = 2 * math.pi
+    thickness_min: float = 1.0
+    thickness_max: float = 4.0
+    brightness_min: float = 0.5
+    brightness_max: float = 1.0
+    p_shape_min: float = 0.0
+    p_shape_max: float = 2.0
+
+
+class LoopDataset(Dataset):
+    """
+    On-the-fly synthetic loop images.
+
+    Returns:
+      x: (1,28,28) tensor, either in [0,1] or MNIST-normalized space
+      y:
+        - int (always 0), if cfg.label_format == "int"
+        - float vector shape (MNIST_NUM_CLASSES,), all zeros, if cfg.label_format == "onehot"
+
+    The all-zeros onehot is intentional: loops have no digit tag, but this allows
+    clean composition inside `CombinedDataset` (multi-hot OR).
+    """
+
+    def __init__(self, cfg: LoopConfig, *, split: Literal["train", "test"]):
+        self.cfg = cfg
+        self.split = str(split)
+        if self.split not in ("train", "test"):
+            raise ValueError("split must be 'train' or 'test'")
+        self.epoch: int = 0
+
+    def __len__(self) -> int:
+        return int(self.cfg.train_length if self.split == "train" else self.cfg.test_length)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def _rng(self, idx: int) -> np.random.Generator:
+        split_offset = 0 if self.split == "train" else 1_000_000_007
+        seed = int(self.cfg.seed) + split_offset + int(idx) * 10_007 + int(self.epoch) * 2_000_033
+        return np.random.default_rng(seed)
+
+    def _postprocess(self, x01: torch.Tensor) -> torch.Tensor:
+        if bool(self.cfg.normalize_like_mnist):
+            return (x01 - MNIST_MEAN) / MNIST_STD
+        return x01
+
+    def _format_label(self):
+        if self.cfg.label_format == "int":
+            return 0
+        return torch.zeros((MNIST_NUM_CLASSES,), dtype=torch.float32)
+
+    def __getitem__(self, idx: int):
+        if idx < 0 or idx >= len(self):
+            raise IndexError(idx)
+        rng = self._rng(int(idx))
+
+        size = float(rng.uniform(self.cfg.size_min, self.cfg.size_max))
+        tx = float(rng.uniform(self.cfg.tx_min, self.cfg.tx_max))
+        ty = float(rng.uniform(self.cfg.ty_min, self.cfg.ty_max))
+        aspect = float(rng.uniform(self.cfg.aspect_min, self.cfg.aspect_max))
+        rotation = float(rng.uniform(self.cfg.rotation_min, self.cfg.rotation_max))
+        thickness = float(rng.uniform(self.cfg.thickness_min, self.cfg.thickness_max))
+        brightness = float(rng.uniform(self.cfg.brightness_min, self.cfg.brightness_max))
+        p_shape = float(rng.uniform(self.cfg.p_shape_min, self.cfg.p_shape_max))
+
+        img = generate_loop_image(
+            size=size,
+            tx=tx,
+            ty=ty,
+            aspect=aspect,
+            rotation=rotation,
+            thickness=thickness,
+            brightness=brightness,
+            p_shape=p_shape,
+            image_size=int(self.cfg.image_size),
+            antialias=bool(self.cfg.antialias),
+        )  # (28,28) float32 in [0,1]
+
+        x01 = torch.from_numpy(img).unsqueeze(0).to(torch.float32)  # (1,28,28)
+        x = self._postprocess(x01)
+        y = self._format_label()
+        return x, y
+
+
+def make_loop_datasets(*, cfg: LoopConfig) -> tuple[Dataset, Dataset]:
+    train_ds = LoopDataset(cfg, split="train")
+    # Ensure eval uses same base sampling seed by default.
+    test_cfg = replace(cfg, seed=int(cfg.seed))
+    test_ds = LoopDataset(test_cfg, split="test")
+    return train_ds, test_ds
+
+
+def make_loop_loaders(
+    *,
+    cfg: LoopConfig,
+    batch_size: int,
+    shuffle_train: bool = True,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+    device: torch.device | None = None,
+) -> tuple[DataLoader, DataLoader]:
+    train_ds, test_ds = make_loop_datasets(cfg=cfg)
+
+    effective_pin_memory = bool(pin_memory)
+    if device is not None:
+        effective_pin_memory = effective_pin_memory and device.type == "cuda"
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=int(batch_size),
+        shuffle=bool(shuffle_train),
+        num_workers=int(num_workers),
+        pin_memory=effective_pin_memory,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=int(batch_size),
+        shuffle=False,
+        num_workers=int(num_workers),
+        pin_memory=effective_pin_memory,
+    )
+    return train_loader, test_loader
 
 
 @dataclass(frozen=True)
@@ -871,6 +1111,7 @@ def make_combined_datasets(
     data_dir: str | Path,
     noise_cfg: NoiseTagConfig,
     lowfreq_cfg: LowFreqTagConfig | None = None,
+    loop_cfg: LoopConfig | None = None,
     mnist_augment_cfg: MNISTAugmentConfig | None = None,
     mnist_normalize: bool = True,
     download: bool = True,
@@ -886,6 +1127,7 @@ def make_combined_datasets(
     - "mnist"
     - "noise_tags"
     - "lowfreq_tag"
+    - "loops"
 
     Output labels are multi-hot float vectors, suitable for multi-label training.
     """
@@ -897,7 +1139,7 @@ def make_combined_datasets(
         if not component_tags:
             raise ValueError("combined.datasets must be null or a non-empty list of dataset tags")
 
-    allowed = {"mnist", "noise_tags", "lowfreq_tag"}
+    allowed = {"mnist", "noise_tags", "lowfreq_tag", "loops"}
     unknown = [t for t in component_tags if t not in allowed]
     if unknown:
         raise ValueError(f"Unknown combined dataset tag(s): {unknown}. Allowed: {sorted(allowed)}")
@@ -937,6 +1179,15 @@ def make_combined_datasets(
             test_parts.append(lf_test)
             continue
 
+        if tag == "loops":
+            l_cfg = loop_cfg if loop_cfg is not None else LoopConfig()
+            # Enforce one-hot for combined labels (loops return an all-zeros vector).
+            effective_l_cfg = l_cfg if l_cfg.label_format == "onehot" else replace(l_cfg, label_format="onehot")
+            loop_train, loop_test = make_loop_datasets(cfg=effective_l_cfg)
+            train_parts.append(loop_train)
+            test_parts.append(loop_test)
+            continue
+
         raise AssertionError("Unreachable")
 
     train_ds = CombinedDataset(train_parts, seed=int(seed), length=length, num_classes=None, clip=clip)
@@ -949,6 +1200,7 @@ def make_combined_loaders(
     data_dir: str | Path,
     noise_cfg: NoiseTagConfig,
     lowfreq_cfg: LowFreqTagConfig | None = None,
+    loop_cfg: LoopConfig | None = None,
     mnist_augment_cfg: MNISTAugmentConfig | None = None,
     batch_size: int,
     shuffle_train: bool = True,
@@ -966,6 +1218,7 @@ def make_combined_loaders(
         data_dir=data_dir,
         noise_cfg=noise_cfg,
         lowfreq_cfg=lowfreq_cfg,
+        loop_cfg=loop_cfg,
         mnist_augment_cfg=mnist_augment_cfg,
         mnist_normalize=mnist_normalize,
         download=download,

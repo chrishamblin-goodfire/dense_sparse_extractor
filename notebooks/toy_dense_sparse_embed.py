@@ -47,9 +47,15 @@ SPARSE_BERNOULLI_P = 0.04
 SPARSE_TOPK_K = 3
 
 # Continuous (dense) component
-CONT_MODE: Literal["subspace_uniform", "subspace_gaussian", "sphere", "torus", "swiss_roll"] = (
-    "sphere"
-)
+CONT_MODE: Literal[
+    "subspace_uniform",
+    "subspace_gaussian",
+    "ambient_gaussian",
+    "sphere",
+    "torus",
+    "swiss_roll",
+    "lowfreq_dct_gaussian",
+] = "sphere"
 CONT_DIM = 3  # intrinsic latent dimension for subspace/sphere; torus uses 2*n_circles
 TORUS_N_CIRCLES = 4  # torus intrinsic dim = 2*TORUS_N_CIRCLES
 
@@ -233,7 +239,15 @@ Continuous (dense) manifold generators
 
 def sample_continuous_latents(
     batch: int,
-    mode: Literal["subspace_uniform", "subspace_gaussian", "sphere", "torus", "swiss_roll"],
+    mode: Literal[
+        "subspace_uniform",
+        "subspace_gaussian",
+        "ambient_gaussian",
+        "sphere",
+        "torus",
+        "swiss_roll",
+        "lowfreq_dct_gaussian",
+    ],
     cont_dim: int,
     torus_n_circles: int,
     device: str,
@@ -251,6 +265,13 @@ def sample_continuous_latents(
         return z, meta
 
     if mode == "subspace_gaussian":
+        z = torch.randn(batch, cont_dim, device=device, dtype=dtype)
+        return z, meta
+
+    if mode == "ambient_gaussian":
+        # Full-dimensional Gaussian in ambient space (we set z_dim = D below).
+        # This is the most VAE-friendly dense source.
+        # Note: distribution is rotation-invariant; using a random orthonormal basis is fine.
         z = torch.randn(batch, cont_dim, device=device, dtype=dtype)
         return z, meta
 
@@ -285,6 +306,13 @@ def sample_continuous_latents(
         meta["h"] = h.squeeze(1)
         return pts, meta
 
+    if mode == "lowfreq_dct_gaussian":
+        # Coefficients for low-frequency DCT basis vectors (smooth 1D signal).
+        # This is the most "DenSaE-like" dense source in this repo: it concentrates energy
+        # in low spatial frequencies.
+        z = torch.randn(batch, cont_dim, device=device, dtype=dtype)
+        return z, meta
+
     raise ValueError(f"Unknown continuous mode: {mode}")
 
 
@@ -318,18 +346,45 @@ else:
 sparse_dirs, sparse_scales = maybe_jitter_norms(sparse_dirs, NORM_JITTER_STD)
 
 # Continuous basis: maps z_dim -> D.
+#
+# Most modes use a random orthonormal basis (a rotated subspace).
+# For `lowfreq_dct_gaussian`, we instead use an explicit low-frequency DCT basis,
+# which creates a dense component that is smooth (low spatial frequency) and thus
+# is amenable to DenSaE-style "smoothness/low-frequency" priors.
 if CONT_MODE == "torus":
     z_dim = 2 * TORUS_N_CIRCLES
 elif CONT_MODE == "swiss_roll":
     z_dim = 3
+elif CONT_MODE == "ambient_gaussian":
+    z_dim = D
 else:
     z_dim = CONT_DIM
 
-if ORTHOGONALIZE_CONT_BASIS and z_dim <= D:
-    cont_basis = qr_orthonormal_rows(z_dim, D, device=DEVICE, dtype=DTYPE)
+
+def dct_orthonormal_basis(n: int, device: str, dtype: torch.dtype) -> torch.Tensor:
+    """
+    Orthonormal DCT-II basis matrix of shape (n, n).
+    Treats each vector x ∈ R^n as a 1D "signal"; low k correspond to low spatial frequency.
+    """
+    nn = torch.arange(n, device=device, dtype=dtype)
+    kk = torch.arange(n, device=device, dtype=dtype)[:, None]
+    basis = torch.cos(math.pi / n * (nn[None, :] + 0.5) * kk)
+    # Orthonormal scaling
+    basis[0] *= math.sqrt(1.0 / n)
+    if n > 1:
+        basis[1:] *= math.sqrt(2.0 / n)
+    return basis
+
+
+if CONT_MODE == "lowfreq_dct_gaussian":
+    # First z_dim rows correspond to lowest frequencies.
+    cont_basis = dct_orthonormal_basis(D, device=DEVICE, dtype=DTYPE)[:z_dim]
 else:
-    cont_basis = torch.randn(z_dim, D, device=DEVICE, dtype=DTYPE)
-    cont_basis = cont_basis / cont_basis.norm(dim=1, keepdim=True).clamp_min(1e-12)
+    if ORTHOGONALIZE_CONT_BASIS and z_dim <= D:
+        cont_basis = qr_orthonormal_rows(z_dim, D, device=DEVICE, dtype=DTYPE)
+    else:
+        cont_basis = torch.randn(z_dim, D, device=DEVICE, dtype=DTYPE)
+        cont_basis = cont_basis / cont_basis.norm(dim=1, keepdim=True).clamp_min(1e-12)
 
 # Optional: jitter continuous basis row norms too (often set this to 0.0; depends what you want).
 cont_basis, cont_scales = maybe_jitter_norms(cont_basis, 0.00)
@@ -1085,4 +1140,538 @@ for i in FEATURES_TO_DIAG:
     plt.show()
 
 
-# %%
+#%%
+"""
+DenSaE-inspired two-branch model for this toy
+
+Your data is: X = (sparse part) + (dense part).
+Standard SAEs assume "everything should be sparse", which can make sparse codes absorb dense variation.
+
+DenSaE's key idea (adapted to vectors):
+- Maintain TWO codes:
+    z_t : dense code (no shrinkage)
+    s_t : sparse code (thresholded / shrinkage)
+- Reconstruct with TWO dictionaries:
+    x_hat = z_T @ A + s_T @ B
+- Infer (z_T, s_T) by unrolling a few proximal-gradient steps, where only the sparse stream
+  gets the shrinkage nonlinearity.
+
+This is the simplest "MCA / DenSaE" baseline you can deploy like an SAE:
+encode -> (z, s), decode -> x_hat, and you can ablate s or z separately.
+"""
+
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+#%%
+def soft_shrink(x: torch.Tensor, thresh: float, twosided: bool) -> torch.Tensor:
+    if twosided:
+        # classic soft thresholding (L1 prox)
+        return torch.sign(x) * torch.relu(torch.abs(x) - thresh)
+    # nonnegative shrinkage (ReLU_b), good match for your binary S toy
+    return torch.relu(x - thresh)
+
+
+class ToyDenSaE(nn.Module):
+    """
+    Vector-valued DenSaE-like unrolled proximal model:
+      minimize 0.5||x - zA - sB||^2 + (1/(2*lambda_x))||zA||^2 + lam*||s||_1  (approx)
+
+    - Dense branch uses gradient steps (no shrinkage).
+    - Sparse branch uses gradient steps + shrinkage.
+    - A and B are learned dictionaries (row-normalized).
+    """
+
+    def __init__(
+        self,
+        d_in: int,
+        d_dense: int,
+        d_sparse: int,
+        *,
+        n_iters: int = 10,
+        alpha_z: float = 0.2,
+        alpha_s: float = 0.2,
+        thresh: float = 0.1,
+        twosided: bool = False,
+        inv_lambda_x: float = 0.0,  # DenSaE-style dense Tikhonov strength: (1/lambda_x)*||zA||^2
+        device: str = "cpu",
+    ):
+        super().__init__()
+        self.d_in = d_in
+        self.d_dense = d_dense
+        self.d_sparse = d_sparse
+        self.n_iters = n_iters
+        self.alpha_z = alpha_z
+        self.alpha_s = alpha_s
+        self.thresh = thresh
+        self.twosided = twosided
+        self.inv_lambda_x = inv_lambda_x
+        self.device = device
+
+        # Dictionaries as decoder matrices (rows are atoms in data space)
+        # A: [d_dense, d_in], B: [d_sparse, d_in]
+        A0 = torch.randn(d_dense, d_in, device=device)
+        B0 = torch.randn(d_sparse, d_in, device=device)
+
+        # Row-normalize to reduce scaling pathologies; training will renormalize too.
+        A0 = A0 / A0.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        B0 = B0 / B0.norm(dim=1, keepdim=True).clamp_min(1e-12)
+
+        self.A = nn.Parameter(A0)
+        self.B = nn.Parameter(B0)
+
+    @torch.no_grad()
+    def normalize_dicts_(self) -> None:
+        self.A.data = self.A.data / self.A.data.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        self.B.data = self.B.data / self.B.data.norm(dim=1, keepdim=True).clamp_min(1e-12)
+
+    def decode(self, z: torch.Tensor, s: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x_dense = z @ self.A
+        x_sparse = s @ self.B
+        return x_dense + x_sparse, x_dense, x_sparse
+
+    def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Initialize codes at 0.
+        z = torch.zeros(x.shape[0], self.d_dense, device=x.device, dtype=x.dtype)
+        s = torch.zeros(x.shape[0], self.d_sparse, device=x.device, dtype=x.dtype)
+
+        for _ in range(self.n_iters):
+            x_hat, x_dense, _ = self.decode(z, s)
+            res = x - x_hat
+
+            # Dense update: gradient step on recon + optional ||x_dense||^2 penalty
+            # grad_z of 0.5||res||^2 is -res @ A^T
+            # so GD ascent form: z += alpha * (res @ A^T)
+            z = z + self.alpha_z * (res @ self.A.T)
+            if self.inv_lambda_x > 0:
+                # DenSaE-style dense Tikhonov: (1/(2*lambda_x))||x_dense||^2
+                # grad wrt z is (1/lambda_x) * (x_dense @ A^T)
+                z = z - self.alpha_z * (self.inv_lambda_x * (x_dense @ self.A.T))
+
+            # Sparse update: gradient step + shrinkage
+            s_pre = s + self.alpha_s * (res @ self.B.T)
+            s = soft_shrink(s_pre, self.thresh, self.twosided)
+
+        return z, s
+
+    def forward(self, x: torch.Tensor):
+        z, s = self.encode(x)
+        x_hat, x_dense, x_sparse = self.decode(z, s)
+        return x_hat, z, s, x_dense, x_sparse
+
+
+#%%
+"""
+Train the ToyDenSaE model on X (no saving, notebook-style).
+"""
+
+DS_DEVICE = DEVICE
+
+# Choose capacities. If you don't know true dims, make them "big enough" and rely on penalties/sparsity.
+DS_DENSE = max(2, CONT_DIM)  # heuristic default: try matching toy intrinsic dim
+DS_SPARSE = OC_N_CONCEPTS if "OC_N_CONCEPTS" in globals() else max(4 * D, 64)
+
+DS_ITERS = 15
+DS_ALPHA_Z = 0.25
+DS_ALPHA_S = 0.25
+DS_THRESH = 0.10  # increase for more sparsity
+DS_TWOSIDED = False
+
+# Dense regularization knobs (DenSaE-style)
+# - `DS_INV_LAMBDA_X_UPDATE` affects the *inference updates* (closest to DenSaE / unrolling).
+# - `DS_DENSE_REG_WEIGHT_LOSS` adds an explicit penalty in the *training loss*.
+DS_INV_LAMBDA_X_UPDATE = 0.0   # set e.g. 0.1, 1.0, 3.0 to test dense Tikhonov pressure in the update
+DS_DENSE_REG_WEIGHT_LOSS = 0.0 # set e.g. 1e-3, 1e-2 if you want extra dense penalty in loss
+
+DS_LR = 3e-3
+DS_EPOCHS = 50
+DS_BATCH = 1024
+
+# Input standardization generally helps these unrolled schemes.
+DS_STANDARDIZE_X = True
+
+X_ds_train = X[: min(20_000, X.shape[0])].to(DS_DEVICE)
+ds_mean = X_ds_train.mean(dim=0, keepdim=True)
+ds_std = X_ds_train.std(dim=0, keepdim=True).clamp_min(1e-6)
+
+if DS_STANDARDIZE_X:
+    X_ds_train_in = (X_ds_train - ds_mean) / ds_std
+    X_ds_full_in = ((X.to(DS_DEVICE) - ds_mean) / ds_std)
+else:
+    X_ds_train_in = X_ds_train
+    X_ds_full_in = X.to(DS_DEVICE)
+
+ds_loader = DataLoader(
+    TensorDataset(X_ds_train_in.detach().cpu()),
+    batch_size=DS_BATCH,
+    shuffle=True,
+    pin_memory=(DS_DEVICE == "cuda"),
+)
+
+toy_densae = ToyDenSaE(
+    d_in=D,
+    d_dense=DS_DENSE,
+    d_sparse=DS_SPARSE,
+    n_iters=DS_ITERS,
+    alpha_z=DS_ALPHA_Z,
+    alpha_s=DS_ALPHA_S,
+    thresh=DS_THRESH,
+    twosided=DS_TWOSIDED,
+    inv_lambda_x=DS_INV_LAMBDA_X_UPDATE,
+    device=DS_DEVICE,
+).to(DS_DEVICE)
+
+opt = torch.optim.Adam(toy_densae.parameters(), lr=DS_LR)
+
+for epoch in range(DS_EPOCHS):
+    toy_densae.train()
+    total = 0.0
+    for (xb_cpu,) in ds_loader:
+        xb = xb_cpu.to(DS_DEVICE, non_blocking=True)
+        x_hat, z, s, x_dense, x_sparse = toy_densae(xb)
+
+        recon = (xb - x_hat).square().mean()
+        # Encourage sparsity in s; if twosided=False, this is just mean(s).
+        sparse_pen = s.abs().mean()
+        # Optional dense Tikhonov penalty on x_dense energy (DenSaE-style bias in data space)
+        dense_pen = x_dense.square().mean()
+
+        # Note: DS_THRESH is the *prox threshold*; this L1 weight is an additional training pressure.
+        loss = recon + (1e-3 * sparse_pen) + (DS_DENSE_REG_WEIGHT_LOSS * dense_pen)
+
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        with torch.no_grad():
+            toy_densae.normalize_dicts_()
+            total += float(loss.item())
+
+    if (epoch + 1) % max(1, DS_EPOCHS // 10) == 0 or epoch == 0:
+        toy_densae.eval()
+        with torch.no_grad():
+            x_hat, z, s, *_ = toy_densae(X_ds_train_in[:2000].to(DS_DEVICE))
+            l0 = (s.abs() > 1e-8).float().sum(dim=1).mean().item()
+            print(f"[ToyDenSaE] epoch {epoch+1:4d}/{DS_EPOCHS}  loss={total/len(ds_loader):.4f}  recon={((X_ds_train_in[:2000].to(DS_DEVICE)-x_hat).square().mean()).item():.4f}  s_L0={l0:.2f}")
+
+
+#%%
+"""
+Encode full dataset and evaluate S-recovery using the *s branch*.
+
+We reuse the AUROC/AP logic, but since ToyDenSaE has two dictionaries (A and B),
+we align the *sparse dictionary* B to the true sparse directions.
+"""
+
+toy_densae.eval()
+with torch.no_grad():
+    # Full encode (might be a bit heavy; reduce N if needed)
+    z_all = []
+    s_all = []
+    for start in range(0, X_ds_full_in.shape[0], 4096):
+        xb = X_ds_full_in[start : start + 4096]
+        _, z, s, *_ = toy_densae(xb)
+        z_all.append(z.detach().cpu())
+        s_all.append(s.detach().cpu())
+
+Z_DS = torch.cat(z_all, dim=0)
+S_DS = torch.cat(s_all, dim=0)  # inferred sparse codes
+print("ToyDenSaE codes:", tuple(Z_DS.shape), tuple(S_DS.shape))
+
+# Align learned B atoms to true sparse dirs
+with torch.no_grad():
+    B_learned = toy_densae.B.detach().cpu()  # [DS_SPARSE, D]
+    V_true = sparse_dirs.detach().cpu()      # [N_SPARSE, D]
+    sims_B = _normalize_rows(B_learned) @ _normalize_rows(V_true).T  # [DS_SPARSE, N_SPARSE]
+
+best_cos = sims_B.max(dim=0).values
+row_ind, col_ind, matched = hungarian_match(sims_B)
+
+metrics = s_recovery_metrics_from_codes(S_DS, S_cpu, row_ind=row_ind, col_ind=col_ind)
+print(
+    "[ToyDenSaE] best cos mean={:.3f} (med {:.3f}) | matched cos mean={:.3f} | AUROC={:.3f} AP={:.3f} (n={})".format(
+        float(best_cos.mean().item()),
+        float(best_cos.median().item()),
+        float(matched.mean().item()),
+        metrics["mean_auroc"],
+        metrics["mean_ap"],
+        metrics["n_eval"],
+    )
+)
+
+
+#%%
+"""
+Additive Dense+Sparse model where the dense component is a VAE
+
+Goal: x ≈ x_dense(z) + x_sparse(s)
+- Dense: VAE with Gaussian latent z and MLP decoder producing x_dense ∈ R^D
+- Sparse: thresholded code s (ReLU_b or soft-shrink) with linear dictionary B producing x_sparse = s @ B
+
+Loss (typical):
+  recon(x, x_hat) + beta * KL(q(z|x) || N(0, I)) + lambda_s * ||s||_1
+
+This is "DenSaE in spirit" (two independently-regularized representations that add),
+but uses a VAE-style dense component rather than a Tikhonov/smoothness prior.
+"""
+
+
+#%%
+class DenseVAEPlusSparse(nn.Module):
+    def __init__(
+        self,
+        d_in: int,
+        z_dim: int,
+        d_sparse: int,
+        *,
+        hidden: int = 128,
+        twosided_sparse: bool = False,
+        sparse_thresh: float = 0.1,
+        # KL scheduling (baked into the model as a helper; training loop supplies global step)
+        kl_beta_max: float = 1e-3,
+        kl_warmup_steps: int = 0,
+        kl_ramp_steps: int = 10_000,
+        kl_schedule: Literal["constant", "linear"] = "linear",
+        device: str = "cpu",
+    ):
+        super().__init__()
+        self.d_in = d_in
+        self.z_dim = z_dim
+        self.d_sparse = d_sparse
+        self.twosided_sparse = twosided_sparse
+        self.sparse_thresh = sparse_thresh
+        self.device = device
+
+        self.kl_beta_max = float(kl_beta_max)
+        self.kl_warmup_steps = int(kl_warmup_steps)
+        self.kl_ramp_steps = int(kl_ramp_steps)
+        self.kl_schedule = kl_schedule
+
+        # VAE encoder q(z|x)
+        self.enc = nn.Sequential(
+            nn.Linear(d_in, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+        )
+        self.enc_mu = nn.Linear(hidden, z_dim)
+        self.enc_logvar = nn.Linear(hidden, z_dim)
+
+        # VAE decoder p(x_dense|z) (deterministic mean reconstruction)
+        self.dec = nn.Sequential(
+            nn.Linear(z_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, d_in),
+        )
+
+        # Sparse encoder: amortized codes from x (then threshold)
+        self.sparse_enc = nn.Linear(d_in, d_sparse, bias=True)
+
+        # Sparse dictionary (decoder): B is [d_sparse, d_in]
+        B0 = torch.randn(d_sparse, d_in, device=device)
+        B0 = B0 / B0.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        self.B = nn.Parameter(B0)
+
+    def kl_beta(self, step: int) -> float:
+        """
+        Return the KL weight β at a given global step.
+        Common practice: warmup then ramp β from 0 → β_max.
+        """
+        if self.kl_schedule == "constant":
+            return self.kl_beta_max
+        if self.kl_schedule != "linear":
+            raise ValueError(f"Unknown kl_schedule: {self.kl_schedule}")
+
+        if step < self.kl_warmup_steps:
+            return 0.0
+        if self.kl_ramp_steps <= 0:
+            return self.kl_beta_max
+        t = (step - self.kl_warmup_steps) / float(self.kl_ramp_steps)
+        t = max(0.0, min(1.0, t))
+        return self.kl_beta_max * t
+
+    @torch.no_grad()
+    def normalize_dict_(self) -> None:
+        self.B.data = self.B.data / self.B.data.norm(dim=1, keepdim=True).clamp_min(1e-12)
+
+    def encode_dense(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        h = self.enc(x)
+        mu = self.enc_mu(h)
+        logvar = self.enc_logvar(h).clamp(min=-20.0, max=10.0)
+        return mu, logvar
+
+    def sample_z(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        eps = torch.randn_like(mu)
+        return mu + eps * torch.exp(0.5 * logvar)
+
+    def decode_dense(self, z: torch.Tensor) -> torch.Tensor:
+        return self.dec(z)
+
+    def encode_sparse(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        pre = self.sparse_enc(x)
+        s = soft_shrink(pre, self.sparse_thresh, self.twosided_sparse)
+        return pre, s
+
+    def decode_sparse(self, s: torch.Tensor) -> torch.Tensor:
+        return s @ self.B
+
+    def forward(self, x: torch.Tensor):
+        mu, logvar = self.encode_dense(x)
+        z = self.sample_z(mu, logvar)
+        x_dense = self.decode_dense(z)
+
+        pre_s, s = self.encode_sparse(x)
+        x_sparse = self.decode_sparse(s)
+
+        x_hat = x_dense + x_sparse
+        return x_hat, (mu, logvar, z), (pre_s, s), (x_dense, x_sparse)
+
+
+def kl_diag_gaussian(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    # KL(q||p) for q=N(mu, diag(exp(logvar))) and p=N(0, I)
+    return 0.5 * torch.sum(torch.exp(logvar) + mu**2 - 1.0 - logvar, dim=1).mean()
+
+
+#%%
+"""
+Train DenseVAEPlusSparse on X.
+
+Note: Gaussian-latent VAE is most naturally matched to CONT_MODE="ambient_gaussian".
+For sphere/torus-like dense sources, KL may fight the geometry; you can set BETA_KL small.
+"""
+
+VS_DEVICE = DEVICE
+
+VS_ZDIM = max(2, CONT_DIM)         # VAE latent dim
+VS_SPARSE = DS_SPARSE if "DS_SPARSE" in globals() else max(4 * D, 64)
+VS_HIDDEN = 128
+
+VS_SPARSE_THRESH = 0.10
+VS_TWOSIDED = False
+
+VS_LR = 3e-3
+VS_EPOCHS = 50
+VS_BATCH = 1024
+
+VS_LAMBDA_S = 1e-3   # sparsity regularizer strength on s
+
+# KL scheduling (common in VAE training)
+VS_KL_BETA_MAX = 1e-3     # final β
+VS_KL_WARMUP_STEPS = 0    # keep β=0 for first steps
+VS_KL_RAMP_STEPS = 10_000 # then linearly ramp β to β_max over this many optimizer steps
+VS_KL_SCHEDULE: Literal["constant", "linear"] = "linear"
+
+VS_STANDARDIZE_X = True
+
+X_vs_train = X[: min(20_000, X.shape[0])].to(VS_DEVICE)
+vs_mean = X_vs_train.mean(dim=0, keepdim=True)
+vs_std = X_vs_train.std(dim=0, keepdim=True).clamp_min(1e-6)
+
+if VS_STANDARDIZE_X:
+    X_vs_train_in = (X_vs_train - vs_mean) / vs_std
+    X_vs_full_in = ((X.to(VS_DEVICE) - vs_mean) / vs_std)
+else:
+    X_vs_train_in = X_vs_train
+    X_vs_full_in = X.to(VS_DEVICE)
+
+vs_loader = DataLoader(
+    TensorDataset(X_vs_train_in.detach().cpu()),
+    batch_size=VS_BATCH,
+    shuffle=True,
+    pin_memory=(VS_DEVICE == "cuda"),
+)
+
+vae_sparse = DenseVAEPlusSparse(
+    d_in=D,
+    z_dim=VS_ZDIM,
+    d_sparse=VS_SPARSE,
+    hidden=VS_HIDDEN,
+    twosided_sparse=VS_TWOSIDED,
+    sparse_thresh=VS_SPARSE_THRESH,
+    kl_beta_max=VS_KL_BETA_MAX,
+    kl_warmup_steps=VS_KL_WARMUP_STEPS,
+    kl_ramp_steps=VS_KL_RAMP_STEPS,
+    kl_schedule=VS_KL_SCHEDULE,
+    device=VS_DEVICE,
+).to(VS_DEVICE)
+
+opt = torch.optim.Adam(vae_sparse.parameters(), lr=VS_LR)
+
+global_step = 0
+for epoch in range(VS_EPOCHS):
+    vae_sparse.train()
+    total = 0.0
+    for (xb_cpu,) in vs_loader:
+        xb = xb_cpu.to(VS_DEVICE, non_blocking=True)
+        x_hat, (mu, logvar, _z), (_pre_s, s), (_xd, _xs) = vae_sparse(xb)
+
+        recon = (xb - x_hat).square().mean()
+        kl = kl_diag_gaussian(mu, logvar)
+        sparse_pen = s.abs().mean()
+        beta = vae_sparse.kl_beta(global_step)
+        loss = recon + (beta * kl) + (VS_LAMBDA_S * sparse_pen)
+
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        with torch.no_grad():
+            vae_sparse.normalize_dict_()
+            total += float(loss.item())
+        global_step += 1
+
+    if (epoch + 1) % max(1, VS_EPOCHS // 10) == 0 or epoch == 0:
+        vae_sparse.eval()
+        with torch.no_grad():
+            x_hat, (mu, logvar, _), (_, s), _ = vae_sparse(X_vs_train_in[:2000].to(VS_DEVICE))
+            l0 = (s.abs() > 1e-8).float().sum(dim=1).mean().item()
+            print(
+                f"[VAE+Sparse] epoch {epoch+1:4d}/{VS_EPOCHS} "
+                f"loss={total/len(vs_loader):.4f} recon={((X_vs_train_in[:2000].to(VS_DEVICE)-x_hat).square().mean()).item():.4f} "
+                f"KL={kl_diag_gaussian(mu, logvar).item():.4f} beta={vae_sparse.kl_beta(global_step):.2e} s_L0={l0:.2f}"
+            )
+
+
+#%%
+"""
+Evaluate S recovery from the sparse branch of DenseVAEPlusSparse.
+"""
+
+vae_sparse.eval()
+with torch.no_grad():
+    S_VS_list = []
+    Z_VS_mu_list = []
+    for start in range(0, X_vs_full_in.shape[0], 4096):
+        xb = X_vs_full_in[start : start + 4096]
+        _xhat, (mu, _logvar, _z), (_pre_s, s), _ = vae_sparse(xb)
+        S_VS_list.append(s.detach().cpu())
+        Z_VS_mu_list.append(mu.detach().cpu())
+
+S_VS = torch.cat(S_VS_list, dim=0)
+Z_VS = torch.cat(Z_VS_mu_list, dim=0)  # use mu as dense representation
+print("VAE+Sparse codes:", tuple(Z_VS.shape), tuple(S_VS.shape))
+
+with torch.no_grad():
+    B_learned = vae_sparse.B.detach().cpu()  # [VS_SPARSE, D]
+    V_true = sparse_dirs.detach().cpu()      # [N_SPARSE, D]
+    sims_B = _normalize_rows(B_learned) @ _normalize_rows(V_true).T
+
+best_cos = sims_B.max(dim=0).values
+row_ind, col_ind, matched = hungarian_match(sims_B)
+metrics = s_recovery_metrics_from_codes(S_VS, S_cpu, row_ind=row_ind, col_ind=col_ind)
+
+print(
+    "[VAE+Sparse] best cos mean={:.3f} (med {:.3f}) | matched cos mean={:.3f} | AUROC={:.3f} AP={:.3f} (n={})".format(
+        float(best_cos.mean().item()),
+        float(best_cos.median().item()),
+        float(matched.mean().item()),
+        metrics["mean_auroc"],
+        metrics["mean_ap"],
+        metrics["n_eval"],
+    )
+)
+
+
+#%%
