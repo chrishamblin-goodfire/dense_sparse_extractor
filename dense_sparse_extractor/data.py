@@ -1242,6 +1242,7 @@ class CombinedDataset(Dataset):
         seed: int = 0,
         num_classes: int | None = None,
         clip: tuple[float, float] | None = None,
+        space_separation: bool = False,
     ):
         if not datasets:
             raise ValueError("datasets must be a non-empty list")
@@ -1260,6 +1261,7 @@ class CombinedDataset(Dataset):
         self.epoch: int = 0
         self.num_classes = None if num_classes is None else int(num_classes)
         self.clip = clip
+        self.space_separation = bool(space_separation)
 
         if length is None:
             # Arbitrary but practical default: as long as the largest dataset.
@@ -1328,14 +1330,24 @@ class CombinedDataset(Dataset):
             if tuple(ys[k].shape) != y0_shape:
                 raise ValueError(f"Label shape mismatch: ds0={y0_shape} dsk={tuple(ys[k].shape)}")
 
-        x_sum = torch.stack(xs, dim=0).sum(dim=0)
+        if bool(self.space_separation):
+            # "Space separation": instead of pixelwise addition, concatenate images
+            # side-by-side along the spatial width dimension.
+            #
+            # For MNIST-like (C,H,W) tensors, this produces (C,H,N*W).
+            # Example: (1,28,28) + (1,28,28) -> (1,28,56)
+            if xs[0].ndim < 2:
+                raise ValueError(f"Expected image tensors with at least 2 dims, got shape={x0_shape}")
+            x_out = torch.cat(xs, dim=-1)
+        else:
+            x_out = torch.stack(xs, dim=0).sum(dim=0)
         if self.clip is not None:
             lo, hi = float(self.clip[0]), float(self.clip[1])
-            x_sum = x_sum.clamp(lo, hi)
+            x_out = x_out.clamp(lo, hi)
 
         y_sum = torch.stack(ys, dim=0).sum(dim=0)
         y_mh = y_sum.clamp(0.0, 1.0)
-        return x_sum, y_mh
+        return x_out, y_mh
 
 
 def make_combined_datasets(
@@ -1352,6 +1364,7 @@ def make_combined_datasets(
     length: int | None = None,
     clip: tuple[float, float] | None = None,
     datasets: Sequence[str] | None = None,
+    space_separation: bool = False,
 ) -> tuple[Dataset, Dataset]:
     """
     Create train/test CombinedDataset datasets from a list of component datasets.
@@ -1433,8 +1446,22 @@ def make_combined_datasets(
 
         raise AssertionError("Unreachable")
 
-    train_ds = CombinedDataset(train_parts, seed=int(seed), length=length, num_classes=None, clip=clip)
-    test_ds = CombinedDataset(test_parts, seed=int(seed) + 1, length=length, num_classes=None, clip=clip)
+    train_ds = CombinedDataset(
+        train_parts,
+        seed=int(seed),
+        length=length,
+        num_classes=None,
+        clip=clip,
+        space_separation=bool(space_separation),
+    )
+    test_ds = CombinedDataset(
+        test_parts,
+        seed=int(seed) + 1,
+        length=length,
+        num_classes=None,
+        clip=clip,
+        space_separation=bool(space_separation),
+    )
     return train_ds, test_ds
 
 
@@ -1456,6 +1483,7 @@ def make_combined_loaders(
     length: int | None = None,
     clip: tuple[float, float] | None = None,
     datasets: Sequence[str] | None = None,
+    space_separation: bool = False,
     device: torch.device | None = None,
 ) -> tuple[DataLoader, DataLoader]:
     train_ds, test_ds = make_combined_datasets(
@@ -1471,6 +1499,7 @@ def make_combined_loaders(
         length=length,
         clip=clip,
         datasets=datasets,
+        space_separation=bool(space_separation),
     )
 
     effective_pin_memory = bool(pin_memory)
