@@ -1561,7 +1561,7 @@ def _parse_args():
     p.add_argument(
         "--mnist_max_brightness",
         type=float,
-        default=.5,
+        default=1,
         help="Clamp MNIST pixels to <= this value in [0,1] space (deterministic). 1.0 disables.",
     )
     p.add_argument("--mnist_jitter_crop", type=int, default=5)
