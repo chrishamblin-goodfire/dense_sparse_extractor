@@ -23,7 +23,9 @@ import math
 import os
 import random
 import sys
+import json
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Literal, Sequence
 
@@ -37,9 +39,11 @@ from torchvision.utils import make_grid
 try:
     from dense_sparse_extractor.data import (
         LoopConfig,
+        LowBitTagConfig,
         LowFreqTagConfig,
         NoiseTagConfig,
         make_combined_datasets,
+        make_lowbit_tag_datasets,
         make_lowfreq_tag_datasets,
         make_loop_datasets,
         make_mnist_datasets,
@@ -51,9 +55,11 @@ except ModuleNotFoundError:
     sys.path.insert(0, str(repo_root))
     from dense_sparse_extractor.data import (  # type: ignore[no-redef]
         LoopConfig,
+        LowBitTagConfig,
         LowFreqTagConfig,
         NoiseTagConfig,
         make_combined_datasets,
+        make_lowbit_tag_datasets,
         make_lowfreq_tag_datasets,
         make_loop_datasets,
         make_mnist_datasets,
@@ -61,7 +67,7 @@ except ModuleNotFoundError:
     )
 
 
-DatasetType = Literal["loops", "lowfreq_tag", "mnist", "combined"]
+DatasetType = Literal["loops", "lowfreq_tag", "lowbit_tag", "mnist", "combined"]
 ModelType = Literal["mlp_vae", "conv_vae", "mlp_sae", "mlp_topk_sae"]
 
 
@@ -97,6 +103,56 @@ def _resolve_device(device: str) -> torch.device:
             return torch.device("cpu")
         return torch.device(device)
     raise ValueError(f"Unknown device: {device}")
+
+
+def _safe_path_component(s: str) -> str:
+    s = (s or "").strip().replace(" ", "_")
+    keep: list[str] = []
+    for ch in s:
+        if ch.isalnum() or ch in ("-", "_", "."):
+            keep.append(ch)
+        else:
+            keep.append("_")
+    out = "".join(keep)
+    return out or "unnamed"
+
+
+def _run_dir(*, checkpoint_root: Path, wandb_project: str, wandb_run_name: str) -> Path:
+    return checkpoint_root / _safe_path_component(wandb_project) / _safe_path_component(wandb_run_name)
+
+
+def _write_json(path: Path, obj) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _save_checkpoint(
+    *,
+    run_dir: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    global_step: int,
+    tag: str | None = None,
+) -> Path:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"epoch_{int(epoch):04d}"
+    if tag:
+        stem = f"{stem}_{_safe_path_component(tag)}"
+    ckpt_path = run_dir / f"{stem}.pt"
+    payload = {
+        "epoch": int(epoch),
+        "global_step": int(global_step),
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "torch_rng_state": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        payload["cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+    torch.save(payload, ckpt_path)
+    # Always update latest.pt to the same payload (overwrite).
+    torch.save(payload, run_dir / "latest.pt")
+    return ckpt_path
 
 
 class XOnlyDataset(Dataset):
@@ -272,6 +328,19 @@ def _make_recon_loaders(
     seed: int,
     loop_cfg: LoopConfig,
     lowfreq_images_per_class: int,
+    lowfreq_classes: Sequence[int] | None,
+    lowfreq_augment: bool,
+    lowfreq_augment_jitter_max: int,
+    lowfreq_augment_gaussian_std: float,
+    lowfreq_augment_apply_to_test: bool,
+    lowfreq_boost: float,
+    lowbit_images_per_class: int,
+    lowbit_classes: Sequence[int] | None,
+    lowbit_augment: bool,
+    lowbit_augment_jitter_max: int,
+    lowbit_augment_gaussian_std: float,
+    lowbit_augment_apply_to_test: bool,
+    lowbit_p_on: float,
     combined_components: Sequence[str],
 ) -> tuple[DataLoader, DataLoader]:
     data_dir = Path(data_dir)
@@ -294,11 +363,36 @@ def _make_recon_loaders(
         lf_cfg = LowFreqTagConfig(
             images_per_class=int(lowfreq_images_per_class),
             seed=int(seed),
+            test_split_same_images=False,
             normalize_like_mnist=False,  # recon in [0,1]
             cache_images=True,
             label_format="onehot",
+            classes=tuple(int(c) for c in lowfreq_classes) if lowfreq_classes is not None else None,
+            lowfreq_boost=float(lowfreq_boost),
+            augment=bool(lowfreq_augment),
+            augment_jitter_max=int(lowfreq_augment_jitter_max),
+            augment_gaussian_std=float(lowfreq_augment_gaussian_std),
+            augment_apply_to_test=bool(lowfreq_augment_apply_to_test),
         )
         train_base, test_base = make_lowfreq_tag_datasets(data_dir=data_dir, cfg=lf_cfg)
+        train_ds = XOnlyDataset(train_base)
+        test_ds = XOnlyDataset(test_base)
+    elif dataset == "lowbit_tag":
+        lb_cfg = LowBitTagConfig(
+            images_per_class=int(lowbit_images_per_class),
+            seed=int(seed),
+            test_split_same_images=False,
+            normalize_like_mnist=False,  # recon in [0,1]
+            cache_images=True,
+            label_format="onehot",
+            classes=tuple(int(c) for c in lowbit_classes) if lowbit_classes is not None else None,
+            p_on=float(lowbit_p_on),
+            augment=bool(lowbit_augment),
+            augment_jitter_max=int(lowbit_augment_jitter_max),
+            augment_gaussian_std=float(lowbit_augment_gaussian_std),
+            augment_apply_to_test=bool(lowbit_augment_apply_to_test),
+        )
+        train_base, test_base = make_lowbit_tag_datasets(cfg=lb_cfg)
         train_ds = XOnlyDataset(train_base)
         test_ds = XOnlyDataset(test_base)
     elif dataset == "combined":
@@ -313,14 +407,36 @@ def _make_recon_loaders(
         lowfreq_cfg = LowFreqTagConfig(
             images_per_class=int(lowfreq_images_per_class),
             seed=int(seed),
+            test_split_same_images=False,
             normalize_like_mnist=False,
             cache_images=True,
             label_format="onehot",
+            classes=tuple(int(c) for c in lowfreq_classes) if lowfreq_classes is not None else None,
+            lowfreq_boost=float(lowfreq_boost),
+            augment=bool(lowfreq_augment),
+            augment_jitter_max=int(lowfreq_augment_jitter_max),
+            augment_gaussian_std=float(lowfreq_augment_gaussian_std),
+            augment_apply_to_test=bool(lowfreq_augment_apply_to_test),
+        )
+        lowbit_cfg = LowBitTagConfig(
+            images_per_class=int(lowbit_images_per_class),
+            seed=int(seed),
+            test_split_same_images=False,
+            normalize_like_mnist=False,
+            cache_images=True,
+            label_format="onehot",
+            classes=tuple(int(c) for c in lowbit_classes) if lowbit_classes is not None else None,
+            p_on=float(lowbit_p_on),
+            augment=bool(lowbit_augment),
+            augment_jitter_max=int(lowbit_augment_jitter_max),
+            augment_gaussian_std=float(lowbit_augment_gaussian_std),
+            augment_apply_to_test=bool(lowbit_augment_apply_to_test),
         )
         train_base, test_base = make_combined_datasets(
             data_dir=data_dir,
             noise_cfg=noise_cfg,
             lowfreq_cfg=lowfreq_cfg,
+            lowbit_cfg=lowbit_cfg,
             loop_cfg=loop_cfg,
             mnist_augment_cfg=None,
             mnist_normalize=False,
@@ -366,16 +482,29 @@ def _log_recon_images(
     loader: DataLoader,
     device: torch.device,
     global_step: int,
-    n_images: int = 64,
+    n_images: int = 8,
     tag: str = "recon",
+    log_prior_samples: bool = True,
+    results: list[dict] | None = None,
 ) -> None:
     import wandb  # type: ignore
 
     model.eval()
-    batch = next(iter(loader))
-    x, _ = batch
-    x = x.to(device)[: int(n_images)]
-    out = model(x)
+    # Use a fixed set of indices for stable visualization across epochs.
+    ds = loader.dataset
+    n = min(int(n_images), len(ds))
+    n = max(1, n)
+    xs: list[torch.Tensor] = []
+    for i in range(n):
+        x_i, _y_i = ds[i]
+        xs.append(x_i)
+    x = torch.stack(xs, dim=0).to(device)
+    # SAEs expect 2D inputs (B, D), while VAEs expect images (B,1,28,28).
+    x_in = x
+    if x_in.ndim > 2 and not hasattr(model, "decode_logits"):
+        x_in = x_in.view(x_in.shape[0], -1)
+
+    out = model(x_in)
 
     # Support both:
     # - VAE-style dict with "recon_logits"
@@ -391,21 +520,61 @@ def _log_recon_images(
     else:
         raise ValueError("Unsupported model output format for recon logging")
 
-    # Make a 2-row grid: originals on top, recon below.
-    grid = make_grid(torch.cat([x, x_hat], dim=0), nrow=int(math.sqrt(n_images)), pad_value=1.0)
-    wandb_run.log({f"images/{tag}": wandb.Image(grid), "step": int(global_step), "global_step": int(global_step)}, step=int(global_step))
+    # Layout requested:
+    # - 8 samples total, 4 columns
+    # - row1: originals[0:4]
+    # - row2: recons[0:4]
+    # - (larger vertical gap)
+    # - row3: originals[4:8]
+    # - row4: recons[4:8]
+    #
+    # We implement this as two separate 2-row grids with a custom gap between them.
+    n = min(int(n_images), int(x.shape[0]))
+    n = max(1, n)
+    n0 = min(4, n)
+    n1 = max(0, n - n0)
 
-    # For VAEs, also log a few random prior samples (SAEs don't have a meaningful prior).
-    if hasattr(model, "decode_logits") and hasattr(model, "z_dim"):
+    pad_value = 1.0
+    pad = 2
+    ncol = 4
+
+    grid_top = make_grid(torch.cat([x[:n0], x_hat[:n0]], dim=0), nrow=ncol, pad_value=pad_value, padding=pad)
+    if n1 > 0:
+        grid_bot = make_grid(torch.cat([x[n0 : n0 + n1], x_hat[n0 : n0 + n1]], dim=0), nrow=ncol, pad_value=pad_value, padding=pad)
+    else:
+        grid_bot = None
+
+    if grid_bot is not None:
+        # Larger gap between the two blocks.
+        gap_px = 12
+        gap = torch.full((grid_top.shape[0], gap_px, grid_top.shape[2]), pad_value, dtype=grid_top.dtype, device=grid_top.device)
+        grid = torch.cat([grid_top, gap, grid_bot], dim=1)
+    else:
+        grid = grid_top
+
+    wandb_run.log({f"images/{tag}": wandb.Image(grid), "step": int(global_step), "global_step": int(global_step)}, step=int(global_step))
+    if results is not None:
+        results.append({"step": int(global_step), "global_step": int(global_step), f"images/{tag}": "<image>"})
+
+    # For VAEs, optionally log a few random prior samples (SAEs don't have a meaningful prior).
+    if bool(log_prior_samples) and hasattr(model, "decode_logits") and hasattr(model, "z_dim"):
         z_dim = int(getattr(model, "z_dim"))
         z = torch.randn(int(n_images), z_dim, device=device)
         decode_logits = getattr(model, "decode_logits")
         samples = torch.sigmoid(decode_logits(z))
-        grid_s = make_grid(samples, nrow=int(math.sqrt(n_images)), pad_value=1.0)
+        grid_s = make_grid(samples[: int(n_images)], nrow=4, pad_value=pad_value, padding=pad)
         wandb_run.log(
             {f"images/{tag}_prior_samples": wandb.Image(grid_s), "step": int(global_step), "global_step": int(global_step)},
             step=int(global_step),
         )
+        if results is not None:
+            results.append(
+                {
+                    "step": int(global_step),
+                    "global_step": int(global_step),
+                    f"images/{tag}_prior_samples": "<image>",
+                }
+            )
 
 
 def train(
@@ -439,7 +608,22 @@ def train(
     wandb_project: str,
     wandb_run_name: str | None,
     lowfreq_images_per_class: int,
+    lowfreq_classes: Sequence[int] | None,
+    lowfreq_augment: bool,
+    lowfreq_augment_jitter_max: int,
+    lowfreq_augment_gaussian_std: float,
+    lowfreq_augment_apply_to_test: bool,
+    lowfreq_boost: float,
+    lowbit_images_per_class: int,
+    lowbit_classes: Sequence[int] | None,
+    lowbit_augment: bool,
+    lowbit_augment_jitter_max: int,
+    lowbit_augment_gaussian_std: float,
+    lowbit_augment_apply_to_test: bool,
+    lowbit_p_on: float,
     loop_cfg: LoopConfig,
+    checkpoint_root: str | Path,
+    checkpoint_interval: int,
 ) -> None:
     _set_seed(int(seed))
 
@@ -453,8 +637,27 @@ def train(
         seed=seed,
         loop_cfg=loop_cfg,
         lowfreq_images_per_class=lowfreq_images_per_class,
+        lowfreq_classes=lowfreq_classes,
+        lowfreq_augment=lowfreq_augment,
+        lowfreq_augment_jitter_max=lowfreq_augment_jitter_max,
+        lowfreq_augment_gaussian_std=lowfreq_augment_gaussian_std,
+        lowfreq_augment_apply_to_test=lowfreq_augment_apply_to_test,
+        lowfreq_boost=lowfreq_boost,
+        lowbit_images_per_class=lowbit_images_per_class,
+        lowbit_classes=lowbit_classes,
+        lowbit_augment=lowbit_augment,
+        lowbit_augment_jitter_max=lowbit_augment_jitter_max,
+        lowbit_augment_gaussian_std=lowbit_augment_gaussian_std,
+        lowbit_augment_apply_to_test=lowbit_augment_apply_to_test,
+        lowbit_p_on=lowbit_p_on,
         combined_components=combined_components,
     )
+
+    # --- checkpoint/run bookkeeping ---
+    checkpoint_root = Path(checkpoint_root)
+    effective_run_name = str(wandb_run_name) if wandb_run_name else f"{dataset}-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_dir = _run_dir(checkpoint_root=checkpoint_root, wandb_project=str(wandb_project), wandb_run_name=effective_run_name)
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     if model_type == "mlp_vae":
         model: nn.Module = MLPVAE(
@@ -486,6 +689,59 @@ def train(
         raise ValueError(f"Unknown model_type: {model_type}")
     opt = torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
 
+    # Save final resolved args/config next to checkpoints.
+    args_snapshot = {
+        "dataset": str(dataset),
+        "data_dir": str(data_dir),
+        "combined_components": list(combined_components),
+        "seed": int(seed),
+        "device": str(device),
+        "epochs": int(epochs),
+        "batch_size": int(batch_size),
+        "num_workers": int(num_workers),
+        "pin_memory": bool(pin_memory),
+        "lr": float(lr),
+        "weight_decay": float(weight_decay),
+        "model_type": str(model_type),
+        "z_dim": int(z_dim),
+        "hidden_channels": int(hidden_channels),
+        "mlp_hidden_dim": int(mlp_hidden_dim),
+        "mlp_layers": int(mlp_layers),
+        "sae_n_concepts": int(sae_n_concepts),
+        "sae_l1_penalty": float(sae_l1_penalty),
+        "topk_k": int(topk_k),
+        "sae_encoder_hidden_dim": int(sae_encoder_hidden_dim),
+        "sae_encoder_layers": int(sae_encoder_layers),
+        "recon_loss": str(recon_loss),
+        "kl_schedule": asdict(kl_sched),
+        "lowfreq_images_per_class": int(lowfreq_images_per_class),
+        "lowfreq_classes": list(lowfreq_classes) if lowfreq_classes is not None else None,
+        "lowfreq_augment": bool(lowfreq_augment),
+        "lowfreq_augment_jitter_max": int(lowfreq_augment_jitter_max),
+        "lowfreq_augment_gaussian_std": float(lowfreq_augment_gaussian_std),
+        "lowfreq_augment_apply_to_test": bool(lowfreq_augment_apply_to_test),
+        "lowfreq_boost": float(lowfreq_boost),
+        "lowbit_images_per_class": int(lowbit_images_per_class),
+        "lowbit_classes": list(lowbit_classes) if lowbit_classes is not None else None,
+        "lowbit_augment": bool(lowbit_augment),
+        "lowbit_augment_jitter_max": int(lowbit_augment_jitter_max),
+        "lowbit_augment_gaussian_std": float(lowbit_augment_gaussian_std),
+        "lowbit_augment_apply_to_test": bool(lowbit_augment_apply_to_test),
+        "lowbit_p_on": float(lowbit_p_on),
+        "loop_cfg": asdict(loop_cfg),
+        "wandb_enabled": bool(wandb_enabled),
+        "wandb_project": str(wandb_project),
+        "wandb_run_name": str(wandb_run_name) if wandb_run_name else None,
+        "effective_run_name": effective_run_name,
+        "checkpoint_root": str(checkpoint_root),
+        "checkpoint_interval": int(checkpoint_interval),
+    }
+    _write_json(run_dir / "args.json", args_snapshot)
+
+    # Save initial checkpoint (epoch 0, right after init).
+    global_step = 0
+    _save_checkpoint(run_dir=run_dir, model=model, optimizer=opt, epoch=0, global_step=global_step, tag="init")
+
     wandb_run = None
     if bool(wandb_enabled):
         try:
@@ -495,36 +751,18 @@ def train(
 
         wandb_run = wandb.init(
             project=str(wandb_project),
-            name=str(wandb_run_name) if wandb_run_name else None,
+            name=effective_run_name,
             config={
-                "dataset": str(dataset),
-                "combined_components": list(combined_components),
-                "seed": int(seed),
-                "device": str(device),
-                "epochs": int(epochs),
-                "batch_size": int(batch_size),
-                "lr": float(lr),
-                "weight_decay": float(weight_decay),
-                "model_type": str(model_type),
-                "z_dim": int(z_dim),
-                "hidden_channels": int(hidden_channels),
-                "mlp_hidden_dim": int(mlp_hidden_dim),
-                "mlp_layers": int(mlp_layers),
-                "sae_n_concepts": int(sae_n_concepts),
-                "sae_l1_penalty": float(sae_l1_penalty),
-                "topk_k": int(topk_k),
-                "sae_encoder_hidden_dim": int(sae_encoder_hidden_dim),
-                "sae_encoder_layers": int(sae_encoder_layers),
-                "recon_loss": str(recon_loss),
-                "kl_schedule": asdict(kl_sched),
-                "lowfreq_images_per_class": int(lowfreq_images_per_class),
-                "loop_cfg": asdict(loop_cfg),
+                **args_snapshot,
             },
         )
         wandb.define_metric("step")
         wandb.define_metric("*", step_metric="step")
 
-    global_step = 0
+    # Accumulate all logs (including those sent to W&B) for a local JSON record.
+    results: list[dict] = []
+    results_path = run_dir / "results.json"
+
     for epoch in range(1, int(epochs) + 1):
         # Ensure epoch-dependent datasets update.
         if hasattr(train_loader.dataset, "set_epoch"):
@@ -534,7 +772,10 @@ def train(
                 pass
 
         model.train()
+        # recon_mean = mean per pixel/element (comparable across SAE/VAE)
         sum_recon = 0.0
+        # recon_per_image = sum over pixels, mean over batch (useful for intuition)
+        sum_recon_per_image = 0.0
         sum_kl = 0.0
         sum_loss = 0.0
         sum_l0 = 0.0
@@ -558,25 +799,30 @@ def train(
 
             if model_type in ("mlp_vae", "conv_vae"):
                 if recon_loss == "bce":
-                    # Average per-batch (sum over pixels, mean over batch)
-                    recon = F.binary_cross_entropy_with_logits(out["recon_logits"], x, reduction="sum") / x.shape[0]  # type: ignore[index]
+                    recon_mean = F.binary_cross_entropy_with_logits(out["recon_logits"], x, reduction="mean")  # type: ignore[index]
+                    recon_per_image = (
+                        F.binary_cross_entropy_with_logits(out["recon_logits"], x, reduction="sum") / x.shape[0]  # type: ignore[index]
+                    )
                 elif recon_loss == "mse":
                     x_hat = torch.sigmoid(out["recon_logits"])  # type: ignore[index]
-                    recon = F.mse_loss(x_hat, x, reduction="mean")
+                    recon_mean = F.mse_loss(x_hat, x, reduction="mean")
+                    recon_per_image = recon_mean * float(x[0].numel())
                 else:
                     raise ValueError(f"Unknown recon_loss: {recon_loss}")
 
                 kl = kl_diag_gaussian(out["mu"], out["logvar"])  # type: ignore[index]
                 beta = kl_sched.beta(global_step)
-                loss = recon + (float(beta) * kl)
+                # Keep the *optimization* loss scale as "per-image" (compatible with old runs).
+                loss = recon_per_image + (float(beta) * kl)
                 l0 = float("nan")
                 dead_ratio = float("nan")
             else:
                 z_pre, z, x_hat_flat = out  # type: ignore[misc]
                 if recon_loss == "bce":
-                    recon = F.binary_cross_entropy_with_logits(x_hat_flat, x_flat, reduction="mean")
+                    recon_mean = F.binary_cross_entropy_with_logits(x_hat_flat, x_flat, reduction="mean")
                 else:
-                    recon = F.mse_loss(x_hat_flat, x_flat, reduction="mean")
+                    recon_mean = F.mse_loss(x_hat_flat, x_flat, reduction="mean")
+                recon_per_image = recon_mean * float(x_flat.shape[1])
 
                 l0 = (z > 0).float().sum(dim=1).mean()
                 sum_l0 += float(l0.item()) * int(x.shape[0])
@@ -586,9 +832,9 @@ def train(
                 # SAE loss: add optional L1 penalty for vanilla SAE.
                 if model_type == "mlp_sae":
                     codes_l1 = z.abs().sum(dim=1).mean()
-                    loss = recon + (float(sae_l1_penalty) * codes_l1)
+                    loss = recon_mean + (float(sae_l1_penalty) * codes_l1)
                 else:
-                    loss = recon
+                    loss = recon_mean
 
                 kl = torch.zeros((), device=device)
                 beta = 0.0
@@ -599,7 +845,8 @@ def train(
 
             bs = int(x.shape[0])
             n_seen += bs
-            sum_recon += float(recon.item()) * bs
+            sum_recon += float(recon_mean.item()) * bs
+            sum_recon_per_image += float(recon_per_image) * bs
             sum_kl += float(kl.item()) * bs
             sum_loss += float(loss.item()) * bs
 
@@ -608,25 +855,28 @@ def train(
             if wandb_run is not None and int(log_every_steps) > 0 and (global_step % int(log_every_steps) == 0):
                 if dead_tracker is not None:
                     dead_ratio = float(dead_tracker.get_dead_ratio())
-                wandb_run.log(
-                    {
+                log_payload = {
                         "epoch": int(epoch),
                         "step": int(global_step),
                         "global_step": int(global_step),
                         "train/loss": float(sum_loss / max(1, n_seen)),
                         "train/recon": float(sum_recon / max(1, n_seen)),
+                        "train/recon_per_image": float(sum_recon_per_image / max(1, n_seen)),
                         "train/kl": float(sum_kl / max(1, n_seen)),
                         "train/kl_beta": float(beta),
                         "train/avg_l0": float(sum_l0 / max(1, n_seen)) if model_type in ("mlp_sae", "mlp_topk_sae") else float("nan"),
                         "train/dead_features": float(dead_ratio) if model_type in ("mlp_sae", "mlp_topk_sae") else float("nan"),
-                    },
-                    step=int(global_step),
-                )
+                }
+                results.append(log_payload)
+                _write_json(results_path, results)
+                if wandb_run is not None:
+                    wandb_run.log(log_payload, step=int(global_step))
 
         # Evaluate
         if int(eval_every_epochs) > 0 and (epoch % int(eval_every_epochs) == 0):
             model.eval()
             t_sum_recon = 0.0
+            t_sum_recon_per_image = 0.0
             t_sum_kl = 0.0
             t_sum_loss = 0.0
             t_sum_l0 = 0.0
@@ -643,20 +893,25 @@ def train(
                     if model_type in ("mlp_vae", "conv_vae"):
                         out = model(x)
                         if recon_loss == "bce":
-                            recon = F.binary_cross_entropy_with_logits(out["recon_logits"], x, reduction="sum") / x.shape[0]  # type: ignore[index]
+                            recon_mean = F.binary_cross_entropy_with_logits(out["recon_logits"], x, reduction="mean")  # type: ignore[index]
+                            recon_per_image = (
+                                F.binary_cross_entropy_with_logits(out["recon_logits"], x, reduction="sum") / x.shape[0]  # type: ignore[index]
+                            )
                         else:
                             x_hat = torch.sigmoid(out["recon_logits"])  # type: ignore[index]
-                            recon = F.mse_loss(x_hat, x, reduction="mean")
+                            recon_mean = F.mse_loss(x_hat, x, reduction="mean")
+                            recon_per_image = recon_mean * float(x[0].numel())
                         kl = kl_diag_gaussian(out["mu"], out["logvar"])  # type: ignore[index]
                         beta = kl_sched.beta(global_step)
-                        loss = recon + (float(beta) * kl)
+                        loss = recon_per_image + (float(beta) * kl)
                     else:
                         x_flat = x.view(x.shape[0], -1)
                         z_pre, z, x_hat_flat = model(x_flat)  # type: ignore[misc]
                         if recon_loss == "bce":
-                            recon = F.binary_cross_entropy_with_logits(x_hat_flat, x_flat, reduction="mean")
+                            recon_mean = F.binary_cross_entropy_with_logits(x_hat_flat, x_flat, reduction="mean")
                         else:
-                            recon = F.mse_loss(x_hat_flat, x_flat, reduction="mean")
+                            recon_mean = F.mse_loss(x_hat_flat, x_flat, reduction="mean")
+                        recon_per_image = recon_mean * float(x_flat.shape[1])
 
                         l0 = (z > 0).float().sum(dim=1).mean()
                         t_sum_l0 += float(l0.item()) * int(x.shape[0])
@@ -665,15 +920,16 @@ def train(
 
                         if model_type == "mlp_sae":
                             codes_l1 = z.abs().sum(dim=1).mean()
-                            loss = recon + (float(sae_l1_penalty) * codes_l1)
+                            loss = recon_mean + (float(sae_l1_penalty) * codes_l1)
                         else:
-                            loss = recon
+                            loss = recon_mean
 
                         kl = torch.zeros((), device=device)
                         beta = 0.0
                     bs = int(x.shape[0])
                     t_seen += bs
-                    t_sum_recon += float(recon.item()) * bs
+                    t_sum_recon += float(recon_mean.item()) * bs
+                    t_sum_recon_per_image += float(recon_per_image) * bs
                     t_sum_kl += float(kl.item()) * bs
                     t_sum_loss += float(loss.item()) * bs
 
@@ -687,38 +943,76 @@ def train(
             if wandb_run is not None:
                 if t_dead_tracker is not None:
                     t_dead_ratio = float(t_dead_tracker.get_dead_ratio())
-                wandb_run.log(
-                    {
+                eval_payload = {
                         "epoch": int(epoch),
                         "step": int(global_step),
                         "global_step": int(global_step),
                         "test/loss": float(t_sum_loss / max(1, t_seen)),
                         "test/recon": float(t_sum_recon / max(1, t_seen)),
+                        "test/recon_per_image": float(t_sum_recon_per_image / max(1, t_seen)),
                         "test/kl": float(t_sum_kl / max(1, t_seen)),
                         "test/kl_beta": float(kl_sched.beta(global_step)),
                         "test/avg_l0": float(t_sum_l0 / max(1, t_seen)) if model_type in ("mlp_sae", "mlp_topk_sae") else float("nan"),
                         "test/dead_features": float(t_dead_ratio) if model_type in ("mlp_sae", "mlp_topk_sae") else float("nan"),
-                    },
-                    step=int(global_step),
+                }
+                results.append(eval_payload)
+                _write_json(results_path, results)
+                wandb_run.log(eval_payload, step=int(global_step))
+                _log_recon_images(
+                    wandb_run=wandb_run,
+                    model=model,
+                    loader=train_loader,
+                    device=device,
+                    global_step=global_step,
+                    tag="train_recon",
+                    log_prior_samples=False,
+                    results=results,
                 )
-                _log_recon_images(wandb_run=wandb_run, model=model, loader=test_loader, device=device, global_step=global_step)
+                _log_recon_images(
+                    wandb_run=wandb_run,
+                    model=model,
+                    loader=test_loader,
+                    device=device,
+                    global_step=global_step,
+                    tag="test_recon",
+                    log_prior_samples=True,
+                    results=results,
+                )
+                _write_json(results_path, results)
+
+        # --- checkpointing ---
+        # Always update latest.pt every epoch (overwrite).
+        _save_checkpoint(run_dir=run_dir, model=model, optimizer=opt, epoch=int(epoch), global_step=int(global_step), tag=None)
+        # Also save explicit checkpoints at:
+        # - epoch 1
+        # - every `checkpoint_interval` epochs
+        interval = max(1, int(checkpoint_interval))
+        if int(epoch) == 1 or (int(epoch) % interval == 0):
+            _save_checkpoint(run_dir=run_dir, model=model, optimizer=opt, epoch=int(epoch), global_step=int(global_step), tag="ckpt")
 
     if wandb_run is not None:
         wandb_run.finish()
+    # Final write of results.
+    _write_json(results_path, results)
 
 
 def _parse_args():
     import argparse
 
-    p = argparse.ArgumentParser(description="VAE reconstruction on loops/lowfreq/MNIST/combined.")
-    p.add_argument("--dataset", type=str, default="combined", choices=["loops", "lowfreq_tag", "mnist", "combined"])
+    p = argparse.ArgumentParser(description="VAE/SAE reconstruction on loops/lowfreq/lowbit/MNIST/combined.")
+    p.add_argument(
+        "--dataset",
+        type=str,
+        default="combined",
+        choices=["loops", "lowfreq_tag", "lowbit_tag", "mnist", "combined"],
+    )
     p.add_argument("--data_dir", type=str, default="./data")
     p.add_argument(
         "--combined_components",
         type=str,
         nargs="+",
         default=["loops", "lowfreq_tag"],
-        help='For dataset=combined. Tags from data.py: "mnist", "noise_tags", "lowfreq_tag", "loops".',
+        help='For dataset=combined. Tags from data.py: "mnist", "noise_tags", "lowfreq_tag", "lowbit_tag", "loops".',
     )
 
     p.add_argument("--seed", type=int, default=0)
@@ -729,7 +1023,7 @@ def _parse_args():
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--pin_memory", action="store_true")
 
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-2)
 
     p.add_argument(
@@ -745,13 +1039,13 @@ def _parse_args():
     p.add_argument("--recon_loss", type=str, default="bce", choices=["bce", "mse"])
 
     # SAE / TopK-SAE knobs (Overcomplete)
-    p.add_argument("--sae_n_concepts", type=int, default=4096)
-    p.add_argument("--sae_l1_penalty", type=float, default=1e-3)
-    p.add_argument("--topk_k", type=int, default=20)
+    p.add_argument("--sae_n_concepts", type=int, default=10000)
+    p.add_argument("--sae_l1_penalty", type=float, default=1e-4)
+    p.add_argument("--topk_k", type=int, default=10)
     p.add_argument("--sae_encoder_hidden_dim", type=int, default=1024)
     p.add_argument("--sae_encoder_layers", type=int, default=3)
 
-    p.add_argument("--kl_beta_max", type=float, default=10)
+    p.add_argument("--kl_beta_max", type=float, default=1)
     p.add_argument("--kl_warmup_steps", type=int, default=0)
     p.add_argument("--kl_ramp_steps", type=int, default=10_000)
 
@@ -761,9 +1055,57 @@ def _parse_args():
     p.add_argument("--disable_wandb", action="store_true", help="Disable Weights & Biases logging.")
     p.add_argument("--wandb_project", type=str, default="dense-sparse-extractor-recon")
     p.add_argument("--wandb_run_name", type=str, default=None)
+    p.add_argument(
+        "--checkpoint_interval",
+        type=int,
+        default=10,
+        help="Save an extra checkpoint every N epochs (in addition to latest.pt each epoch).",
+    )
+    p.add_argument(
+        "--checkpoint_root",
+        type=str,
+        default=str(Path(__file__).resolve().parents[1] / "checkpoints"),
+        help="Root directory for checkpoints; run saved under <root>/<wandb_project>/<wandb_run_name>/",
+    )
 
     # Lowfreq dataset size knob
-    p.add_argument("--lowfreq_images_per_class", type=int, default=200)
+    p.add_argument("--lowfreq_images_per_class", type=int, default=500)
+    p.add_argument(
+        "--lowfreq_classes",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Optional subset of digit classes for lowfreq tags (e.g. --lowfreq_classes 0 1 2). Default: all 0-9.",
+    )
+    p.add_argument(
+        "--lowfreq_augment",
+        action="store_true",
+        help="Enable lowfreq-tag augmentations (default: off).",
+    )
+    p.add_argument("--lowfreq_augment_jitter_max", type=int, default=2)
+    p.add_argument("--lowfreq_augment_gaussian_std", type=float, default=0.0)
+    p.add_argument("--lowfreq_augment_apply_to_test", action="store_true")
+    p.add_argument(
+        "--lowfreq_boost",
+        type=float,
+        default=0.0,
+        help="Low-frequency boost exponent for lowfreq tags. Set to 0.0 to disable.",
+    )
+
+    # Lowbit dataset knobs (mirrors lowfreq, but uses sparse Bernoulli bits)
+    p.add_argument("--lowbit_images_per_class", type=int, default=500)
+    p.add_argument(
+        "--lowbit_classes",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Optional subset of digit classes for lowbit tags (e.g. --lowbit_classes 0 1 2). Default: all 0-9.",
+    )
+    p.add_argument("--lowbit_p_on", type=float, default=0.01, help="Pixel-on probability for lowbit tags (default 0.01).")
+    p.add_argument("--lowbit_augment", action="store_true", help="Enable lowbit-tag augmentations (default: off).")
+    p.add_argument("--lowbit_augment_jitter_max", type=int, default=2)
+    p.add_argument("--lowbit_augment_gaussian_std", type=float, default=0.0)
+    p.add_argument("--lowbit_augment_apply_to_test", action="store_true")
 
     # Loop dataset knobs
     p.add_argument("--loop_train_length", type=int, default=200_000)
@@ -776,8 +1118,8 @@ def _parse_args():
 def main() -> None:
     args = _parse_args()
     wandb_enabled = not bool(args.disable_wandb)
-    if wandb_enabled and args.wandb_run_name is None:
-        from datetime import datetime
+    # Ensure we always have a run name (used for checkpoint foldering).
+    if args.wandb_run_name is None:
         args.wandb_run_name = f"{args.dataset}-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     device = _resolve_device(str(args.device))
 
@@ -826,7 +1168,22 @@ def main() -> None:
         wandb_project=str(args.wandb_project),
         wandb_run_name=args.wandb_run_name,
         lowfreq_images_per_class=int(args.lowfreq_images_per_class),
+        lowfreq_classes=list(args.lowfreq_classes) if args.lowfreq_classes is not None else None,
+        lowfreq_augment=bool(args.lowfreq_augment),
+        lowfreq_augment_jitter_max=int(args.lowfreq_augment_jitter_max),
+        lowfreq_augment_gaussian_std=float(args.lowfreq_augment_gaussian_std),
+        lowfreq_augment_apply_to_test=bool(args.lowfreq_augment_apply_to_test),
+        lowfreq_boost=float(args.lowfreq_boost),
+        lowbit_images_per_class=int(args.lowbit_images_per_class),
+        lowbit_classes=list(args.lowbit_classes) if args.lowbit_classes is not None else None,
+        lowbit_augment=bool(args.lowbit_augment),
+        lowbit_augment_jitter_max=int(args.lowbit_augment_jitter_max),
+        lowbit_augment_gaussian_std=float(args.lowbit_augment_gaussian_std),
+        lowbit_augment_apply_to_test=bool(args.lowbit_augment_apply_to_test),
+        lowbit_p_on=float(args.lowbit_p_on),
         loop_cfg=loop_cfg,
+        checkpoint_root=str(args.checkpoint_root),
+        checkpoint_interval=int(args.checkpoint_interval),
     )
 
 
