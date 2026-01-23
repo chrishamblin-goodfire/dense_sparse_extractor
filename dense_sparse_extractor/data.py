@@ -268,6 +268,7 @@ class MNISTAugmentConfig:
       above clip_min so that 1.0 maps to a randomly sampled max brightness in
       [clip_min, 1.0].
     - jitter crop: zero-pad by jitter pixels then random crop back to 28x28
+    - rotation: random in-plane rotation in degrees (about image center)
     - gaussian noise: additive N(0, gaussian_std) in [0,1] space
     """
 
@@ -277,8 +278,10 @@ class MNISTAugmentConfig:
     brightness_clip_min: float = 0.5
     # Jitter crop in pixels. 0 disables.
     jitter_crop: int = 0
+    # Random rotation degrees. 0 disables. (Uses torchvision RandomRotation.)
+    rotation_degrees: float = 0.0
     # Additive Gaussian noise std in [0,1] space. 0 disables.
-    gaussian_std: float = 0.03
+    gaussian_std: float = 0.0
     # Apply augmentations to test split (default: train-only).
     augment_apply_to_test: bool = False
 
@@ -331,6 +334,22 @@ def mnist_transform(*, normalize: bool = True, augment_cfg: MNISTAugmentConfig |
         if j > 0:
             tfms.append(transforms.Pad(padding=j, fill=0))
             tfms.append(transforms.RandomCrop(size=28))
+
+        deg = float(augment_cfg.rotation_degrees)
+        if deg < 0:
+            raise ValueError("rotation_degrees must be >= 0")
+        if deg > 0.0:
+            # Keep this robust across torchvision versions (some accept interpolation/fill, some don't).
+            try:
+                tfms.append(
+                    transforms.RandomRotation(
+                        degrees=deg,
+                        interpolation=getattr(transforms, "InterpolationMode").BILINEAR,  # type: ignore[attr-defined]
+                        fill=0,
+                    )
+                )
+            except Exception:
+                tfms.append(transforms.RandomRotation(degrees=deg))
 
         c = float(augment_cfg.brightness_clip_min)
         if c > 0.0:
@@ -867,6 +886,9 @@ class LowBitTagConfig:
 
     # Bernoulli sparsity for pixel "on" probability.
     p_on: float = 0.01  # ~1/100
+    # When a pixel is "on", sample its brightness ~ Uniform(on_min_brightness, 1.0).
+    # Setting this to 1.0 recovers the original binary behavior (on pixels are exactly 1.0).
+    on_min_brightness: float = 0.5
 
     # Optional augmentations (applied in [0,1] space before normalization).
     augment: bool = True
@@ -895,6 +917,11 @@ class LowBitTagDataset(Dataset):
         if p < 0.0 or p > 1.0:
             raise ValueError("p_on must be in [0,1]")
         self.p_on = p
+
+        bmin = float(cfg.on_min_brightness)
+        if bmin < 0.0 or bmin > 1.0:
+            raise ValueError("on_min_brightness must be in [0,1]")
+        self.on_min_brightness = bmin
 
         # Which digit-tags exist in this dataset.
         if cfg.classes is None:
@@ -933,8 +960,12 @@ class LowBitTagDataset(Dataset):
         g = torch.Generator()
         # Deterministic per-(cls, j) sampling.
         g.manual_seed(int(self.cfg.seed) + cls * 1_000_003 + j * 10_007)
-        x = (torch.rand(MNIST_IMAGE_SHAPE, generator=g, dtype=torch.float32) < self.p_on).to(torch.float32)
-        return x
+        mask = torch.rand(MNIST_IMAGE_SHAPE, generator=g, dtype=torch.float32) < self.p_on
+        if self.on_min_brightness >= 1.0:
+            return mask.to(torch.float32)
+        vals = torch.empty(MNIST_IMAGE_SHAPE, dtype=torch.float32)
+        vals.uniform_(float(self.on_min_brightness), 1.0, generator=g)
+        return torch.where(mask, vals, torch.zeros_like(vals))
 
     def _generate_all_01(self) -> torch.Tensor:
         imgs = torch.empty(

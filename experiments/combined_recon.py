@@ -41,6 +41,7 @@ try:
         LoopConfig,
         LowBitTagConfig,
         LowFreqTagConfig,
+        MNISTAugmentConfig,
         NoiseTagConfig,
         make_combined_datasets,
         make_lowbit_tag_datasets,
@@ -57,6 +58,7 @@ except ModuleNotFoundError:
         LoopConfig,
         LowBitTagConfig,
         LowFreqTagConfig,
+        MNISTAugmentConfig,
         NoiseTagConfig,
         make_combined_datasets,
         make_lowbit_tag_datasets,
@@ -68,7 +70,8 @@ except ModuleNotFoundError:
 
 
 DatasetType = Literal["loops", "lowfreq_tag", "lowbit_tag", "mnist", "combined"]
-ModelType = Literal["mlp_vae", "conv_vae", "mlp_sae", "mlp_topk_sae"]
+ModelType = Literal["mlp_vae", "conv_vae", "mlp_sae", "mlp_topk_sae", "combined_ae"]
+CombinedSAEType = Literal["mlp_sae", "mlp_topk_sae"]
 
 
 def _maybe_import_overcomplete():
@@ -290,6 +293,42 @@ class ConvVAE(nn.Module):
         return {"mu": mu, "logvar": logvar, "z": z, "recon_logits": logits}
 
 
+class CombinedAE(nn.Module):
+    """
+    Combine an MLP VAE with an (MLP) SAE/TopK-SAE by summing reconstruction logits:
+        recon_logits(x) = recon_logits_vae(x) + recon_logits_sae(x)
+    """
+
+    def __init__(self, *, vae: MLPVAE, sae: nn.Module):
+        super().__init__()
+        self.vae = vae
+        self.sae = sae
+        self.z_dim = int(getattr(vae, "z_dim"))
+
+    def decode_logits(self, z: torch.Tensor) -> torch.Tensor:
+        # Delegate prior samples to the VAE component only.
+        return self.vae.decode_logits(z)
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        vae_out = self.vae(x)
+        vae_logits = vae_out["recon_logits"]
+
+        x_flat = x.view(x.shape[0], -1)
+        z_pre, z, x_hat_flat = self.sae(x_flat)  # type: ignore[misc]
+        sae_logits = x_hat_flat.view(x.shape[0], 1, 28, 28)
+
+        combined_logits = vae_logits + sae_logits
+        return {
+            "recon_logits": combined_logits,
+            "mu": vae_out["mu"],
+            "logvar": vae_out["logvar"],
+            "vae_recon_logits": vae_logits,
+            "sae_recon_logits": sae_logits,
+            "sae_z_pre": z_pre,
+            "sae_z": z,
+        }
+
+
 def kl_diag_gaussian(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
     # Average over batch (sum over dims)
     return 0.5 * torch.sum(torch.exp(logvar) + mu**2 - 1.0 - logvar, dim=1).mean()
@@ -327,6 +366,12 @@ def _make_recon_loaders(
     device: torch.device,
     seed: int,
     loop_cfg: LoopConfig,
+    mnist_augment: bool,
+    mnist_brightness_clip_min: float,
+    mnist_jitter_crop: int,
+    mnist_rotation_degrees: float,
+    mnist_gaussian_std: float,
+    mnist_augment_apply_to_test: bool,
     lowfreq_images_per_class: int,
     lowfreq_classes: Sequence[int] | None,
     lowfreq_augment: bool,
@@ -350,12 +395,22 @@ def _make_recon_loaders(
         train_ds = XOnlyDataset(train_base)
         test_ds = XOnlyDataset(test_base)
     elif dataset == "mnist":
+        mnist_aug = None
+        if bool(mnist_augment):
+            mnist_aug = MNISTAugmentConfig(
+                augment=True,
+                brightness_clip_min=float(mnist_brightness_clip_min),
+                jitter_crop=int(mnist_jitter_crop),
+                rotation_degrees=float(mnist_rotation_degrees),
+                gaussian_std=float(mnist_gaussian_std),
+                augment_apply_to_test=bool(mnist_augment_apply_to_test),
+            )
         train_base, test_base = make_mnist_datasets(
             data_dir=data_dir,
             normalize=False,  # recon in [0,1]
             label_format="int",
             download=True,
-            augment_cfg=None,
+            augment_cfg=mnist_aug,
         )
         train_ds = XOnlyDataset(train_base)
         test_ds = XOnlyDataset(test_base)
@@ -404,6 +459,16 @@ def _make_recon_loaders(
             cache_images=True,
             label_format="onehot",
         )
+        mnist_aug = None
+        if bool(mnist_augment):
+            mnist_aug = MNISTAugmentConfig(
+                augment=True,
+                brightness_clip_min=float(mnist_brightness_clip_min),
+                jitter_crop=int(mnist_jitter_crop),
+                rotation_degrees=float(mnist_rotation_degrees),
+                gaussian_std=float(mnist_gaussian_std),
+                augment_apply_to_test=bool(mnist_augment_apply_to_test),
+            )
         lowfreq_cfg = LowFreqTagConfig(
             images_per_class=int(lowfreq_images_per_class),
             seed=int(seed),
@@ -438,7 +503,7 @@ def _make_recon_loaders(
             lowfreq_cfg=lowfreq_cfg,
             lowbit_cfg=lowbit_cfg,
             loop_cfg=loop_cfg,
-            mnist_augment_cfg=None,
+            mnist_augment_cfg=mnist_aug,
             mnist_normalize=False,
             download=True,
             seed=int(seed),
@@ -600,6 +665,13 @@ def train(
     topk_k: int,
     sae_encoder_hidden_dim: int,
     sae_encoder_layers: int,
+    combined_sae_type: CombinedSAEType = "mlp_topk_sae",
+    mnist_augment: bool,
+    mnist_brightness_clip_min: float,
+    mnist_jitter_crop: int,
+    mnist_rotation_degrees: float,
+    mnist_gaussian_std: float,
+    mnist_augment_apply_to_test: bool,
     recon_loss: Literal["bce", "mse"],
     kl_sched: KLBetaSchedule,
     log_every_steps: int,
@@ -636,6 +708,12 @@ def train(
         device=device,
         seed=seed,
         loop_cfg=loop_cfg,
+        mnist_augment=mnist_augment,
+        mnist_brightness_clip_min=mnist_brightness_clip_min,
+        mnist_jitter_crop=mnist_jitter_crop,
+        mnist_rotation_degrees=mnist_rotation_degrees,
+        mnist_gaussian_std=mnist_gaussian_std,
+        mnist_augment_apply_to_test=mnist_augment_apply_to_test,
         lowfreq_images_per_class=lowfreq_images_per_class,
         lowfreq_classes=lowfreq_classes,
         lowfreq_augment=lowfreq_augment,
@@ -667,6 +745,32 @@ def train(
         ).to(device)
     elif model_type == "conv_vae":
         model = ConvVAE(z_dim=int(z_dim), hidden_channels=int(hidden_channels)).to(device)
+    elif model_type == "combined_ae":
+        oc = _maybe_import_overcomplete()
+        SAE = oc.sae.SAE  # type: ignore[attr-defined]
+        TopKSAE = oc.sae.TopKSAE  # type: ignore[attr-defined]
+        MLPEncoder = oc.sae.MLPEncoder  # type: ignore[attr-defined]
+
+        vae = MLPVAE(
+            z_dim=int(z_dim),
+            hidden_dim=int(mlp_hidden_dim),
+            n_layers=int(mlp_layers),
+        ).to(device)
+
+        enc = MLPEncoder(
+            28 * 28,
+            int(sae_n_concepts),
+            hidden_dim=int(sae_encoder_hidden_dim),
+            nb_blocks=int(sae_encoder_layers),
+            residual=False,
+            device=str(device),
+        )
+        if combined_sae_type == "mlp_sae":
+            sae = SAE(28 * 28, int(sae_n_concepts), encoder_module=enc, device=str(device))
+        else:
+            sae = TopKSAE(28 * 28, int(sae_n_concepts), top_k=int(topk_k), encoder_module=enc, device=str(device))
+
+        model = CombinedAE(vae=vae, sae=sae).to(device)
     elif model_type in ("mlp_sae", "mlp_topk_sae"):
         oc = _maybe_import_overcomplete()
         SAE = oc.sae.SAE  # type: ignore[attr-defined]
@@ -712,6 +816,13 @@ def train(
         "topk_k": int(topk_k),
         "sae_encoder_hidden_dim": int(sae_encoder_hidden_dim),
         "sae_encoder_layers": int(sae_encoder_layers),
+        "combined_sae_type": str(combined_sae_type),
+        "mnist_augment": bool(mnist_augment),
+        "mnist_brightness_clip_min": float(mnist_brightness_clip_min),
+        "mnist_jitter_crop": int(mnist_jitter_crop),
+        "mnist_rotation_degrees": float(mnist_rotation_degrees),
+        "mnist_gaussian_std": float(mnist_gaussian_std),
+        "mnist_augment_apply_to_test": bool(mnist_augment_apply_to_test),
         "recon_loss": str(recon_loss),
         "kl_schedule": asdict(kl_sched),
         "lowfreq_images_per_class": int(lowfreq_images_per_class),
@@ -780,24 +891,20 @@ def train(
         sum_loss = 0.0
         sum_l0 = 0.0
         n_seen = 0
-        dead_ratio = float("nan")
-
-        dead_tracker = None
-        if model_type in ("mlp_sae", "mlp_topk_sae"):
-            oc = _maybe_import_overcomplete()
-            DeadCodeTracker = oc.sae.trackers.DeadCodeTracker  # type: ignore[attr-defined]
-            dead_tracker = DeadCodeTracker(int(sae_n_concepts), str(device))
+        alive_mask = None
+        if model_type in ("mlp_sae", "mlp_topk_sae", "combined_ae"):
+            alive_mask = torch.zeros(int(sae_n_concepts), dtype=torch.bool, device=device)
 
         for step_in_epoch, (x, _y) in enumerate(train_loader, start=1):
             x = x.to(device)
-            if model_type in ("mlp_vae", "conv_vae"):
+            if model_type in ("mlp_vae", "conv_vae", "combined_ae"):
                 out = model(x)
             else:
                 x_flat = x.view(x.shape[0], -1)
                 z_pre, z, x_hat_flat = model(x_flat)  # type: ignore[misc]
                 out = (z_pre, z, x_hat_flat)
 
-            if model_type in ("mlp_vae", "conv_vae"):
+            if model_type in ("mlp_vae", "conv_vae", "combined_ae"):
                 if recon_loss == "bce":
                     recon_mean = F.binary_cross_entropy_with_logits(out["recon_logits"], x, reduction="mean")  # type: ignore[index]
                     recon_per_image = (
@@ -813,9 +920,21 @@ def train(
                 kl = kl_diag_gaussian(out["mu"], out["logvar"])  # type: ignore[index]
                 beta = kl_sched.beta(global_step)
                 # Keep the *optimization* loss scale as "per-image" (compatible with old runs).
-                loss = recon_per_image + (float(beta) * kl)
+                sae_reg = torch.zeros((), device=device)
                 l0 = float("nan")
-                dead_ratio = float("nan")
+                if model_type == "combined_ae":
+                    z = out["sae_z"]  # type: ignore[index]
+                    l0_t = (z > 0).float().sum(dim=1).mean()
+                    sum_l0 += float(l0_t.item()) * int(x.shape[0])
+                    l0 = float(l0_t.item())
+                    if alive_mask is not None:
+                        alive_mask |= (z > 0).any(dim=0)
+
+                    if combined_sae_type == "mlp_sae":
+                        codes_l1 = z.abs().sum(dim=1).mean()
+                        sae_reg = float(sae_l1_penalty) * codes_l1
+
+                loss = recon_per_image + (float(beta) * kl) + sae_reg
             else:
                 z_pre, z, x_hat_flat = out  # type: ignore[misc]
                 if recon_loss == "bce":
@@ -826,8 +945,8 @@ def train(
 
                 l0 = (z > 0).float().sum(dim=1).mean()
                 sum_l0 += float(l0.item()) * int(x.shape[0])
-                if dead_tracker is not None:
-                    dead_tracker.update(z)
+                if alive_mask is not None:
+                    alive_mask |= (z > 0).any(dim=0)
 
                 # SAE loss: add optional L1 penalty for vanilla SAE.
                 if model_type == "mlp_sae":
@@ -853,8 +972,16 @@ def train(
             global_step += 1
 
             if wandb_run is not None and int(log_every_steps) > 0 and (global_step % int(log_every_steps) == 0):
-                if dead_tracker is not None:
-                    dead_ratio = float(dead_tracker.get_dead_ratio())
+                alive_count = float("nan")
+                alive_pct = float("nan")
+                dead_count = float("nan")
+                dead_pct = float("nan")
+                if alive_mask is not None:
+                    total = float(int(sae_n_concepts))
+                    alive_count = float(alive_mask.sum().item())
+                    alive_pct = float(alive_count / max(1.0, total))
+                    dead_count = float(total - alive_count)
+                    dead_pct = float(1.0 - alive_pct)
                 log_payload = {
                         "epoch": int(epoch),
                         "step": int(global_step),
@@ -864,8 +991,14 @@ def train(
                         "train/recon_per_image": float(sum_recon_per_image / max(1, n_seen)),
                         "train/kl": float(sum_kl / max(1, n_seen)),
                         "train/kl_beta": float(beta),
-                        "train/avg_l0": float(sum_l0 / max(1, n_seen)) if model_type in ("mlp_sae", "mlp_topk_sae") else float("nan"),
-                        "train/dead_features": float(dead_ratio) if model_type in ("mlp_sae", "mlp_topk_sae") else float("nan"),
+                        "train/avg_l0": float(sum_l0 / max(1, n_seen))
+                        if model_type in ("mlp_sae", "mlp_topk_sae", "combined_ae")
+                        else float("nan"),
+                        # Derived consistently from alive_count.
+                        "train/alive_features": float(alive_count),
+                        "train/alive_features_pct": float(alive_pct),
+                        "train/dead_features": float(dead_pct),
+                        "train/dead_features_count": float(dead_count),
                 }
                 results.append(log_payload)
                 _write_json(results_path, results)
@@ -881,16 +1014,13 @@ def train(
             t_sum_loss = 0.0
             t_sum_l0 = 0.0
             t_seen = 0
-            t_dead_ratio = float("nan")
-            t_dead_tracker = None
-            if model_type in ("mlp_sae", "mlp_topk_sae"):
-                oc = _maybe_import_overcomplete()
-                DeadCodeTracker = oc.sae.trackers.DeadCodeTracker  # type: ignore[attr-defined]
-                t_dead_tracker = DeadCodeTracker(int(sae_n_concepts), str(device))
+            t_alive_mask = None
+            if model_type in ("mlp_sae", "mlp_topk_sae", "combined_ae"):
+                t_alive_mask = torch.zeros(int(sae_n_concepts), dtype=torch.bool, device=device)
             with torch.no_grad():
                 for x, _y in test_loader:
                     x = x.to(device)
-                    if model_type in ("mlp_vae", "conv_vae"):
+                    if model_type in ("mlp_vae", "conv_vae", "combined_ae"):
                         out = model(x)
                         if recon_loss == "bce":
                             recon_mean = F.binary_cross_entropy_with_logits(out["recon_logits"], x, reduction="mean")  # type: ignore[index]
@@ -903,7 +1033,17 @@ def train(
                             recon_per_image = recon_mean * float(x[0].numel())
                         kl = kl_diag_gaussian(out["mu"], out["logvar"])  # type: ignore[index]
                         beta = kl_sched.beta(global_step)
-                        loss = recon_per_image + (float(beta) * kl)
+                        sae_reg = torch.zeros((), device=device)
+                        if model_type == "combined_ae":
+                            z = out["sae_z"]  # type: ignore[index]
+                            l0_t = (z > 0).float().sum(dim=1).mean()
+                            t_sum_l0 += float(l0_t.item()) * int(x.shape[0])
+                            if t_alive_mask is not None:
+                                t_alive_mask |= (z > 0).any(dim=0)
+                            if combined_sae_type == "mlp_sae":
+                                codes_l1 = z.abs().sum(dim=1).mean()
+                                sae_reg = float(sae_l1_penalty) * codes_l1
+                        loss = recon_per_image + (float(beta) * kl) + sae_reg
                     else:
                         x_flat = x.view(x.shape[0], -1)
                         z_pre, z, x_hat_flat = model(x_flat)  # type: ignore[misc]
@@ -915,8 +1055,8 @@ def train(
 
                         l0 = (z > 0).float().sum(dim=1).mean()
                         t_sum_l0 += float(l0.item()) * int(x.shape[0])
-                        if t_dead_tracker is not None:
-                            t_dead_tracker.update(z)
+                        if t_alive_mask is not None:
+                            t_alive_mask |= (z > 0).any(dim=0)
 
                         if model_type == "mlp_sae":
                             codes_l1 = z.abs().sum(dim=1).mean()
@@ -941,8 +1081,16 @@ def train(
             print(msg, flush=True)
 
             if wandb_run is not None:
-                if t_dead_tracker is not None:
-                    t_dead_ratio = float(t_dead_tracker.get_dead_ratio())
+                t_alive_count = float("nan")
+                t_alive_pct = float("nan")
+                t_dead_count = float("nan")
+                t_dead_pct = float("nan")
+                if t_alive_mask is not None:
+                    total = float(int(sae_n_concepts))
+                    t_alive_count = float(t_alive_mask.sum().item())
+                    t_alive_pct = float(t_alive_count / max(1.0, total))
+                    t_dead_count = float(total - t_alive_count)
+                    t_dead_pct = float(1.0 - t_alive_pct)
                 eval_payload = {
                         "epoch": int(epoch),
                         "step": int(global_step),
@@ -952,8 +1100,13 @@ def train(
                         "test/recon_per_image": float(t_sum_recon_per_image / max(1, t_seen)),
                         "test/kl": float(t_sum_kl / max(1, t_seen)),
                         "test/kl_beta": float(kl_sched.beta(global_step)),
-                        "test/avg_l0": float(t_sum_l0 / max(1, t_seen)) if model_type in ("mlp_sae", "mlp_topk_sae") else float("nan"),
-                        "test/dead_features": float(t_dead_ratio) if model_type in ("mlp_sae", "mlp_topk_sae") else float("nan"),
+                        "test/avg_l0": float(t_sum_l0 / max(1, t_seen))
+                        if model_type in ("mlp_sae", "mlp_topk_sae", "combined_ae")
+                        else float("nan"),
+                        "test/alive_features": float(t_alive_count),
+                        "test/alive_features_pct": float(t_alive_pct),
+                        "test/dead_features": float(t_dead_pct),
+                        "test/dead_features_count": float(t_dead_count),
                 }
                 results.append(eval_payload)
                 _write_json(results_path, results)
@@ -1011,7 +1164,7 @@ def _parse_args():
         "--combined_components",
         type=str,
         nargs="+",
-        default=["loops", "lowfreq_tag"],
+        default=["mnist", "lowbit_tag"],
         help='For dataset=combined. Tags from data.py: "mnist", "noise_tags", "lowfreq_tag", "lowbit_tag", "loops".',
     )
 
@@ -1030,7 +1183,7 @@ def _parse_args():
         "--model",
         type=str,
         default="mlp_vae",
-        choices=["mlp_vae", "conv_vae", "mlp_sae", "mlp_topk_sae"],
+        choices=["mlp_vae", "conv_vae", "mlp_sae", "mlp_topk_sae", "combined_ae"],
     )
     p.add_argument("--z_dim", type=int, default=16)
     p.add_argument("--mlp_hidden_dim", type=int, default=1024)
@@ -1038,12 +1191,27 @@ def _parse_args():
     p.add_argument("--hidden_channels", type=int, default=32)
     p.add_argument("--recon_loss", type=str, default="bce", choices=["bce", "mse"])
 
+    # MNIST augmentations (enabled by default for MNIST / MNIST-in-combined).
+    p.add_argument("--disable_mnist_augment", action="store_true")
+    p.add_argument("--mnist_brightness_clip_min", type=float, default=0.5)
+    p.add_argument("--mnist_jitter_crop", type=int, default=5)
+    p.add_argument("--mnist_rotation_degrees", type=float, default=10.0)
+    p.add_argument("--mnist_gaussian_std", type=float, default=0.0)
+    p.add_argument("--mnist_augment_apply_to_test", action="store_true")
+
     # SAE / TopK-SAE knobs (Overcomplete)
     p.add_argument("--sae_n_concepts", type=int, default=10000)
     p.add_argument("--sae_l1_penalty", type=float, default=1e-4)
     p.add_argument("--topk_k", type=int, default=10)
     p.add_argument("--sae_encoder_hidden_dim", type=int, default=1024)
     p.add_argument("--sae_encoder_layers", type=int, default=3)
+    p.add_argument(
+        "--combined_sae_type",
+        type=str,
+        default="mlp_topk_sae",
+        choices=["mlp_sae", "mlp_topk_sae"],
+        help="Only used when --model combined_ae. Select which SAE variant to combine with the MLP VAE.",
+    )
 
     p.add_argument("--kl_beta_max", type=float, default=1)
     p.add_argument("--kl_warmup_steps", type=int, default=0)
@@ -1160,6 +1328,13 @@ def main() -> None:
         topk_k=int(args.topk_k),
         sae_encoder_hidden_dim=int(args.sae_encoder_hidden_dim),
         sae_encoder_layers=int(args.sae_encoder_layers),
+        combined_sae_type=str(args.combined_sae_type),  # type: ignore[arg-type]
+        mnist_augment=not bool(args.disable_mnist_augment),
+        mnist_brightness_clip_min=float(args.mnist_brightness_clip_min),
+        mnist_jitter_crop=int(args.mnist_jitter_crop),
+        mnist_rotation_degrees=float(args.mnist_rotation_degrees),
+        mnist_gaussian_std=float(args.mnist_gaussian_std),
+        mnist_augment_apply_to_test=bool(args.mnist_augment_apply_to_test),
         recon_loss=str(args.recon_loss),  # type: ignore[arg-type]
         kl_sched=kl_sched,
         log_every_steps=int(args.log_every_steps),
