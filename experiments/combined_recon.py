@@ -383,6 +383,7 @@ def _make_recon_loaders(
     loop_cfg: LoopConfig,
     mnist_augment: bool,
     mnist_brightness_clip_min: float,
+    mnist_max_brightness: float,
     mnist_jitter_crop: int,
     mnist_rotation_degrees: float,
     mnist_gaussian_std: float,
@@ -401,6 +402,7 @@ def _make_recon_loaders(
     lowbit_augment_gaussian_std: float,
     lowbit_augment_apply_to_test: bool,
     lowbit_p_on: float,
+    lowbit_on_min_brightness: float,
     combined_components: Sequence[str],
     combined_space_separation: bool,
 ) -> tuple[DataLoader, DataLoader]:
@@ -412,10 +414,11 @@ def _make_recon_loaders(
         test_ds = XOnlyDataset(test_base)
     elif dataset == "mnist":
         mnist_aug = None
-        if bool(mnist_augment):
+        if bool(mnist_augment) or float(mnist_max_brightness) < 1.0:
             mnist_aug = MNISTAugmentConfig(
-                augment=True,
+                augment=bool(mnist_augment),
                 brightness_clip_min=float(mnist_brightness_clip_min),
+                max_brightness=float(mnist_max_brightness),
                 jitter_crop=int(mnist_jitter_crop),
                 rotation_degrees=float(mnist_rotation_degrees),
                 gaussian_std=float(mnist_gaussian_std),
@@ -458,6 +461,7 @@ def _make_recon_loaders(
             label_format="onehot",
             classes=tuple(int(c) for c in lowbit_classes) if lowbit_classes is not None else None,
             p_on=float(lowbit_p_on),
+            on_min_brightness=float(lowbit_on_min_brightness),
             augment=bool(lowbit_augment),
             augment_jitter_max=int(lowbit_augment_jitter_max),
             augment_gaussian_std=float(lowbit_augment_gaussian_std),
@@ -476,10 +480,11 @@ def _make_recon_loaders(
             label_format="onehot",
         )
         mnist_aug = None
-        if bool(mnist_augment):
+        if bool(mnist_augment) or float(mnist_max_brightness) < 1.0:
             mnist_aug = MNISTAugmentConfig(
-                augment=True,
+                augment=bool(mnist_augment),
                 brightness_clip_min=float(mnist_brightness_clip_min),
+                max_brightness=float(mnist_max_brightness),
                 jitter_crop=int(mnist_jitter_crop),
                 rotation_degrees=float(mnist_rotation_degrees),
                 gaussian_std=float(mnist_gaussian_std),
@@ -508,6 +513,7 @@ def _make_recon_loaders(
             label_format="onehot",
             classes=tuple(int(c) for c in lowbit_classes) if lowbit_classes is not None else None,
             p_on=float(lowbit_p_on),
+            on_min_brightness=float(lowbit_on_min_brightness),
             augment=bool(lowbit_augment),
             augment_jitter_max=int(lowbit_augment_jitter_max),
             augment_gaussian_std=float(lowbit_augment_gaussian_std),
@@ -721,6 +727,7 @@ def train(
     combined_tag_weight: float = 1.0,
     combined_tag_pos_weight: float = 1.0,
     combined_partition_experts: bool = False,
+    pos_weight: float = 1.0,
     seed: int,
     device: torch.device,
     epochs: int,
@@ -754,6 +761,7 @@ def train(
     densae_twosided_u: bool = True,
     mnist_augment: bool,
     mnist_brightness_clip_min: float,
+    mnist_max_brightness: float,
     mnist_jitter_crop: int,
     mnist_rotation_degrees: float,
     mnist_gaussian_std: float,
@@ -779,6 +787,7 @@ def train(
     lowbit_augment_gaussian_std: float,
     lowbit_augment_apply_to_test: bool,
     lowbit_p_on: float,
+    lowbit_on_min_brightness: float,
     loop_cfg: LoopConfig,
     checkpoint_root: str | Path,
     checkpoint_interval: int,
@@ -796,6 +805,7 @@ def train(
         loop_cfg=loop_cfg,
         mnist_augment=mnist_augment,
         mnist_brightness_clip_min=mnist_brightness_clip_min,
+        mnist_max_brightness=mnist_max_brightness,
         mnist_jitter_crop=mnist_jitter_crop,
         mnist_rotation_degrees=mnist_rotation_degrees,
         mnist_gaussian_std=mnist_gaussian_std,
@@ -814,6 +824,7 @@ def train(
         lowbit_augment_gaussian_std=lowbit_augment_gaussian_std,
         lowbit_augment_apply_to_test=lowbit_augment_apply_to_test,
         lowbit_p_on=lowbit_p_on,
+        lowbit_on_min_brightness=lowbit_on_min_brightness,
         combined_components=combined_components,
         combined_space_separation=bool(combined_space_separation),
     )
@@ -849,10 +860,21 @@ def train(
     def _make_recon_weights(x_img: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Build (weight_mask, pos_weight) broadcastable to x_img.
-        Only active for combined+space_separation; otherwise returns all-ones.
+        - weight_mask: applies to all losses (BCE/MSE), all pixels
+        - pos_weight: only used for BCE, weights positive targets (x==1)
+
+        Global `pos_weight` applies everywhere (no dataset/region checks).
+        Tag-only weights apply only for combined+space_separation via component_slices.
         """
         wmask = torch.ones_like(x_img, dtype=torch.float32)
         posw: torch.Tensor | None = None
+
+        pw = float(pos_weight)
+        if (not math.isfinite(pw)) or pw <= 0.0:
+            raise ValueError(f"pos_weight must be finite and > 0, got {pos_weight}")
+        if pw != 1.0:
+            posw = torch.ones_like(x_img, dtype=torch.float32) * pw
+
         if component_slices is None:
             return wmask, posw
 
@@ -869,7 +891,8 @@ def train(
                     wmask[..., sl] = wmask[..., sl] * tag_w
 
         if tag_pos_w != 1.0:
-            posw = torch.ones_like(x_img, dtype=torch.float32)
+            if posw is None:
+                posw = torch.ones_like(x_img, dtype=torch.float32)
             for name, sl in component_slices:
                 if name != "mnist":
                     posw[..., sl] = posw[..., sl] * tag_pos_w
@@ -1010,6 +1033,7 @@ def train(
         "combined_tag_weight": float(combined_tag_weight),
         "combined_tag_pos_weight": float(combined_tag_pos_weight),
         "combined_partition_experts": bool(combined_partition_experts),
+        "pos_weight": float(pos_weight),
         "seed": int(seed),
         "device": str(device),
         "inferred_image_shape": list(image_shape),
@@ -1045,6 +1069,7 @@ def train(
         "densae_twosided_u": bool(densae_twosided_u),
         "mnist_augment": bool(mnist_augment),
         "mnist_brightness_clip_min": float(mnist_brightness_clip_min),
+        "mnist_max_brightness": float(mnist_max_brightness),
         "mnist_jitter_crop": int(mnist_jitter_crop),
         "mnist_rotation_degrees": float(mnist_rotation_degrees),
         "mnist_gaussian_std": float(mnist_gaussian_std),
@@ -1065,6 +1090,7 @@ def train(
         "lowbit_augment_gaussian_std": float(lowbit_augment_gaussian_std),
         "lowbit_augment_apply_to_test": bool(lowbit_augment_apply_to_test),
         "lowbit_p_on": float(lowbit_p_on),
+        "lowbit_on_min_brightness": float(lowbit_on_min_brightness),
         "loop_cfg": asdict(loop_cfg),
         "wandb_enabled": bool(wandb_enabled),
         "wandb_project": str(wandb_project),
@@ -1491,6 +1517,15 @@ def _parse_args():
             "Train VAE recon only on the MNIST slice and SAE recon only on non-MNIST slices."
         ),
     )
+    p.add_argument(
+        "--pos_weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Global BCE pos_weight applied to ALL pixels (no region checks). "
+            "Only used when --recon_loss bce. Multiplies any per-region pos weights."
+        ),
+    )
 
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
@@ -1517,7 +1552,18 @@ def _parse_args():
 
     # MNIST augmentations (enabled by default for MNIST / MNIST-in-combined).
     p.add_argument("--disable_mnist_augment", action="store_true")
-    p.add_argument("--mnist_brightness_clip_min", type=float, default=0.5)
+    p.add_argument(
+        "--mnist_brightness_clip_min",
+        type=float,
+        default=0.0,
+        help="(Deprecated / no-op) Previously enabled random brightness ceiling. Kept for backward compatibility.",
+    )
+    p.add_argument(
+        "--mnist_max_brightness",
+        type=float,
+        default=.5,
+        help="Clamp MNIST pixels to <= this value in [0,1] space (deterministic). 1.0 disables.",
+    )
     p.add_argument("--mnist_jitter_crop", type=int, default=5)
     p.add_argument("--mnist_rotation_degrees", type=float, default=10.0)
     p.add_argument("--mnist_gaussian_std", type=float, default=0.0)
@@ -1627,6 +1673,12 @@ def _parse_args():
         help="Optional subset of digit classes for lowbit tags (e.g. --lowbit_classes 0 1 2). Default: all 0-9.",
     )
     p.add_argument("--lowbit_p_on", type=float, default=0.03, help="Pixel-on probability for lowbit tags (default 0.05).")
+    p.add_argument(
+        "--lowbit_on_min_brightness",
+        type=float,
+        default=1.0,
+        help="When a lowbit pixel is on, sample brightness ~ Uniform(on_min_brightness, 1.0). Set to 1.0 for binary 0/1.",
+    )
     p.add_argument("--lowbit_augment", action="store_true", help="Enable lowbit-tag augmentations (default: off).")
     p.add_argument("--lowbit_augment_jitter_max", type=int, default=2)
     p.add_argument("--lowbit_augment_gaussian_std", type=float, default=0.0)
@@ -1671,6 +1723,7 @@ def main() -> None:
         combined_tag_weight=float(args.combined_tag_weight),
         combined_tag_pos_weight=float(args.combined_tag_pos_weight),
         combined_partition_experts=bool(args.combined_partition_experts),
+        pos_weight=float(args.pos_weight),
         seed=int(args.seed),
         device=device,
         epochs=int(args.epochs),
@@ -1704,6 +1757,7 @@ def main() -> None:
         densae_twosided_u=not bool(args.densae_one_sided_u),
         mnist_augment=not bool(args.disable_mnist_augment),
         mnist_brightness_clip_min=float(args.mnist_brightness_clip_min),
+        mnist_max_brightness=float(args.mnist_max_brightness),
         mnist_jitter_crop=int(args.mnist_jitter_crop),
         mnist_rotation_degrees=float(args.mnist_rotation_degrees),
         mnist_gaussian_std=float(args.mnist_gaussian_std),
@@ -1729,6 +1783,7 @@ def main() -> None:
         lowbit_augment_gaussian_std=float(args.lowbit_augment_gaussian_std),
         lowbit_augment_apply_to_test=bool(args.lowbit_augment_apply_to_test),
         lowbit_p_on=float(args.lowbit_p_on),
+        lowbit_on_min_brightness=float(args.lowbit_on_min_brightness),
         loop_cfg=loop_cfg,
         checkpoint_root=str(args.checkpoint_root),
         checkpoint_interval=int(args.checkpoint_interval),

@@ -264,18 +264,21 @@ class MNISTAugmentConfig:
     """
     Optional MNIST augmentations applied in [0,1] pixel space (before normalization).
 
-    - brightness clipping: keeps pixels <= clip_min unchanged, but compresses pixels
-      above clip_min so that 1.0 maps to a randomly sampled max brightness in
-      [clip_min, 1.0].
+    - brightness clipping: (DEPRECATED) previously applied a random per-image brightness ceiling.
+      This was useful as an augmentation but makes recon experiments harder to interpret.
+      The code path is intentionally disabled; prefer `max_brightness` below instead.
+    - max brightness clamp: deterministically clamps pixels to <= max_brightness.
     - jitter crop: zero-pad by jitter pixels then random crop back to 28x28
     - rotation: random in-plane rotation in degrees (about image center)
     - gaussian noise: additive N(0, gaussian_std) in [0,1] space
     """
 
     augment: bool = True
-    # Brightness clipping parameter. Set to 0.0 to disable.
-    # Typical value: 0.5
-    brightness_clip_min: float = 0.5
+    # (DEPRECATED / no-op) Kept only for backwards compatibility with old configs.
+    # Set to 0.0 to avoid confusion.
+    brightness_clip_min: float = 0.0
+    # Deterministic max brightness clamp in [0,1]. Set to 1.0 to disable.
+    max_brightness: float = 1.0
     # Jitter crop in pixels. 0 disables.
     jitter_crop: int = 0
     # Random rotation degrees. 0 disables. (Uses torchvision RandomRotation.)
@@ -324,6 +327,19 @@ class _MNISTAddGaussianNoise:
         return (x + n).clamp_(0.0, 1.0)
 
 
+class _MNISTClampMaxBrightness:
+    def __init__(self, *, max_brightness: float):
+        self.max_brightness = float(max_brightness)
+        if self.max_brightness < 0.0 or self.max_brightness > 1.0:
+            raise ValueError("max_brightness must be in [0,1]")
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        m = float(self.max_brightness)
+        if m >= 1.0:
+            return x
+        return x.clamp_max(m)
+
+
 def mnist_transform(*, normalize: bool = True, augment_cfg: MNISTAugmentConfig | None = None) -> transforms.Compose:
     tfms: list[transforms.Transform] = [transforms.ToTensor()]
 
@@ -351,13 +367,17 @@ def mnist_transform(*, normalize: bool = True, augment_cfg: MNISTAugmentConfig |
             except Exception:
                 tfms.append(transforms.RandomRotation(degrees=deg))
 
-        c = float(augment_cfg.brightness_clip_min)
-        if c > 0.0:
-            tfms.append(_MNISTRandomBrightnessCeiling(clip_min=c))
+        # NOTE: random brightness ceiling is deprecated/no-op by design.
 
         std = float(augment_cfg.gaussian_std)
         if std > 0.0:
             tfms.append(_MNISTAddGaussianNoise(std=std))
+
+    # Deterministic clamp can be used even when augmentations are disabled.
+    if augment_cfg is not None:
+        mb = float(getattr(augment_cfg, "max_brightness", 1.0))
+        if mb < 1.0:
+            tfms.append(_MNISTClampMaxBrightness(max_brightness=mb))
 
     if normalize:
         tfms.append(transforms.Normalize((MNIST_MEAN,), (MNIST_STD,)))
@@ -396,10 +416,22 @@ def make_mnist_datasets(
 ) -> tuple[Dataset, Dataset]:
     root = str(Path(data_dir))
     train_tfm = mnist_transform(normalize=bool(normalize), augment_cfg=augment_cfg)
-    # By default, test split gets no augmentation.
+    # By default, test split gets no stochastic augmentation. However, deterministic
+    # preprocessing (e.g. max_brightness clamp) should still be applied when configured.
     test_aug = None
-    if augment_cfg is not None and bool(augment_cfg.augment) and bool(augment_cfg.augment_apply_to_test):
-        test_aug = augment_cfg
+    if augment_cfg is not None:
+        if bool(augment_cfg.augment) and bool(augment_cfg.augment_apply_to_test):
+            test_aug = augment_cfg
+        else:
+            # Keep deterministic clamp settings but disable stochastic transforms.
+            test_aug = replace(
+                augment_cfg,
+                augment=False,
+                jitter_crop=0,
+                rotation_degrees=0.0,
+                gaussian_std=0.0,
+                augment_apply_to_test=False,
+            )
     test_tfm = mnist_transform(normalize=bool(normalize), augment_cfg=test_aug)
     train_base = datasets.MNIST(root=root, train=True, download=bool(download), transform=train_tfm)
     test_base = datasets.MNIST(root=root, train=False, download=bool(download), transform=test_tfm)
